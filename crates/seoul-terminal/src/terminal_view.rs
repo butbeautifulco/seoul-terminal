@@ -17,7 +17,8 @@ use seoul_vt::{Terminal, TerminalBuilder};
 use seoul_workspace::settings::SettingsStore;
 
 use crate::daemon_client::{DaemonClient, DaemonClientWriter, DaemonSessionHandle};
-use crate::terminal_element::{RowRunsBuffer, render_terminal};
+use crate::terminal_element::render_terminal;
+use crate::terminal_render_cache::TerminalRenderCache;
 
 actions!(terminal, [Paste, Copy]);
 
@@ -94,9 +95,8 @@ pub struct TerminalView {
     pending_bounds: Option<TerminalBounds>,
     resize_ack_timeout_epoch: u64,
     resize_ack_rx: async_channel::Receiver<(u16, u16)>,
-    // Per-view paint buffer reused across frames so render_terminal() doesn't
-    // re-allocate Vec<Vec<CellRun>> + inner Strings every dirty frame.
-    row_runs_buf: RowRunsBuffer,
+    // Per-view terminal render cache rebuilt only for dirty rows.
+    render_cache: Rc<RefCell<TerminalRenderCache>>,
     // Background task that drains PTY bytes from `data_rx`, batches them with
     // a short coalescing window, and feeds them into the terminal on the main
     // thread. `None` until a real data_rx is wired up (e.g. local PTY ready
@@ -355,7 +355,7 @@ impl TerminalView {
             pending_bounds: None,
             resize_ack_timeout_epoch: 0,
             resize_ack_rx: Self::empty_ack_rx(),
-            row_runs_buf: Rc::new(RefCell::new(Vec::new())),
+            render_cache: Rc::new(RefCell::new(TerminalRenderCache::default())),
             data_drain_task: None,
             resize_ack_drain_task: None,
         };
@@ -425,7 +425,7 @@ impl TerminalView {
             pending_bounds: None,
             resize_ack_timeout_epoch: 0,
             resize_ack_rx: Self::empty_ack_rx(),
-            row_runs_buf: Rc::new(RefCell::new(Vec::new())),
+            render_cache: Rc::new(RefCell::new(TerminalRenderCache::default())),
             data_drain_task: None,
             resize_ack_drain_task: None,
         }
@@ -782,7 +782,7 @@ impl TerminalView {
             // closed-sender placeholder. spawn_resize_ack_drain is called
             // from initialize_attached_terminal once bounds resolve.
             resize_ack_rx: Self::empty_ack_rx(),
-            row_runs_buf: Rc::new(RefCell::new(Vec::new())),
+            render_cache: Rc::new(RefCell::new(TerminalRenderCache::default())),
             data_drain_task: None,
             resize_ack_drain_task: None,
         };
@@ -1786,7 +1786,7 @@ impl Render for TerminalView {
             ch,
             cursor_visible,
             self.scrollbar_visible,
-            &self.row_runs_buf,
+            &self.render_cache,
         );
 
         // IME preedit overlay

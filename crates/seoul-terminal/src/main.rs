@@ -18,6 +18,7 @@ mod resource_indicator;
 mod settings_view;
 mod syntax;
 mod terminal_element;
+mod terminal_render_cache;
 mod terminal_view;
 mod text_input;
 mod theme;
