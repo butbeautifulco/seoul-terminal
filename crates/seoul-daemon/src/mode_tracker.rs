@@ -1,7 +1,7 @@
 //! Lightweight terminal mode tracker.
 //!
 //! Parses PTY output for DECSET/DECRST (`ESC[?...h`/`ESC[?...l`) mode changes
-//! and OSC-7 (`ESC]7;file://...BEL`) CWD updates. Tracks 14 terminal modes
+//! and OSC-7 (`ESC]7;file://...BEL`) CWD updates. Tracks 20 terminal modes
 //! that affect input behavior and can generate rehydration escape sequences
 //! to restore modes on warm attach.
 
@@ -22,8 +22,14 @@ pub struct TerminalModes {
     pub focus_reporting: bool,         // DECSET 1004
     pub mouse_utf8: bool,              // DECSET 1005
     pub mouse_sgr: bool,               // DECSET 1006
+    pub mouse_urxvt: bool,             // DECSET 1015
+    pub mouse_sgr_pixels: bool,        // DECSET 1016
     pub alternate_screen: bool,        // DECSET 47/1049
     pub bracketed_paste: bool,         // DECSET 2004
+    pub synchronized_output: bool,      // DECSET 2026
+    pub grapheme_cluster: bool,         // DECSET 2027
+    pub color_scheme_report: bool,      // DECSET 2031
+    pub in_band_resize_reports: bool,   // DECSET 2048
 }
 
 impl Default for TerminalModes {
@@ -41,8 +47,14 @@ impl Default for TerminalModes {
             focus_reporting: false,
             mouse_utf8: false,
             mouse_sgr: false,
+            mouse_urxvt: false,
+            mouse_sgr_pixels: false,
             alternate_screen: false,
             bracketed_paste: false,
+            synchronized_output: false,
+            grapheme_cluster: false,
+            color_scheme_report: false,
+            in_band_resize_reports: false,
         }
     }
 }
@@ -216,8 +228,14 @@ impl ModeTracker {
         emit(1004, m.focus_reporting, d.focus_reporting);
         emit(1005, m.mouse_utf8, d.mouse_utf8);
         emit(1006, m.mouse_sgr, d.mouse_sgr);
+        emit(1015, m.mouse_urxvt, d.mouse_urxvt);
+        emit(1016, m.mouse_sgr_pixels, d.mouse_sgr_pixels);
         emit(1049, m.alternate_screen, d.alternate_screen);
         emit(2004, m.bracketed_paste, d.bracketed_paste);
+        emit(2026, m.synchronized_output, d.synchronized_output);
+        emit(2027, m.grapheme_cluster, d.grapheme_cluster);
+        emit(2031, m.color_scheme_report, d.color_scheme_report);
+        emit(2048, m.in_band_resize_reports, d.in_band_resize_reports);
 
         seq
     }
@@ -249,7 +267,13 @@ impl ModeTracker {
             1004 => self.modes.focus_reporting = enabled,
             1005 => self.modes.mouse_utf8 = enabled,
             1006 => self.modes.mouse_sgr = enabled,
+            1015 => self.modes.mouse_urxvt = enabled,
+            1016 => self.modes.mouse_sgr_pixels = enabled,
             2004 => self.modes.bracketed_paste = enabled,
+            2026 => self.modes.synchronized_output = enabled,
+            2027 => self.modes.grapheme_cluster = enabled,
+            2031 => self.modes.color_scheme_report = enabled,
+            2048 => self.modes.in_band_resize_reports = enabled,
             _ => {} // Untracked mode
         }
     }
@@ -383,6 +407,32 @@ mod tests {
         assert!(s.contains("\x1b[?1h"));
         assert!(s.contains("\x1b[?25l"));
         assert!(s.contains("\x1b[?2004h"));
+    }
+
+    #[test]
+    fn tracks_extended_restore_modes_for_rehydrate() {
+        let mut t = ModeTracker::new();
+        t.process(b"\x1b[?1015;1016;2026;2027;2031;2048h");
+
+        assert!(t.modes().mouse_urxvt);
+        assert!(t.modes().mouse_sgr_pixels);
+        assert!(t.modes().synchronized_output);
+        assert!(t.modes().grapheme_cluster);
+        assert!(t.modes().color_scheme_report);
+        assert!(t.modes().in_band_resize_reports);
+
+        let seq = t.generate_rehydrate_sequences();
+        let s = String::from_utf8(seq).unwrap();
+        assert!(s.contains("\x1b[?1015h"));
+        assert!(s.contains("\x1b[?1016h"));
+        assert!(s.contains("\x1b[?2026h"));
+        assert!(s.contains("\x1b[?2027h"));
+        assert!(s.contains("\x1b[?2031h"));
+        assert!(s.contains("\x1b[?2048h"));
+
+        t.process(b"\x1b[?2026;2048l");
+        assert!(!t.modes().synchronized_output);
+        assert!(!t.modes().in_band_resize_reports);
     }
 
     #[test]

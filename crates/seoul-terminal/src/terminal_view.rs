@@ -655,6 +655,8 @@ impl TerminalView {
                 terminal.feed_pty_data_silently(b"\x1b[?1015l");
                 terminal.feed_pty_data_silently(b"\x1b[?1016l");
             }
+            terminal.feed_pty_data_silently(b"\x1b[?2026l");
+            terminal.feed_pty_data_silently(b"\x1b[?2048l");
             terminal.feed_pty_data_silently(b"\x1b[?1l");
             terminal.feed_pty_data_silently(b"\x1b[?66l");
             terminal.feed_pty_data_silently(b"\x1b[?5l");

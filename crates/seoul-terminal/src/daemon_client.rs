@@ -83,6 +83,7 @@ type ResizeAckSenders = Arc<Mutex<HashMap<SessionId, async_channel::Sender<(u16,
 /// Per-request oneshot channel for routing RPC responses by session_id.
 type PendingRequests = Arc<Mutex<HashMap<SessionId, mpsc::Sender<Frame>>>>;
 const INITIAL_ATTACH_SCROLLBACK_LIMIT_BYTES: usize = 128 * 1024;
+const APP_SESSION_DATA_CHANNEL_CAPACITY: usize = 512;
 
 /// Messages enqueued for the central daemon-writer thread.
 /// All daemon-bound IPC routes through this enum so that encode/lock/flush
@@ -602,9 +603,18 @@ impl DaemonClient {
                 // Streaming events → per-session channels
                 MessageType::Data => {
                     if let Ok(msg) = frame.decode_msg::<DataMsg>() {
-                        let senders = session_senders.lock().unwrap();
-                        if let Some(tx) = senders.get(&msg.session_id) {
-                            tx.send_blocking(msg.data).ok();
+                        let tx = {
+                            let senders = session_senders.lock().unwrap();
+                            senders.get(&msg.session_id).cloned()
+                        };
+                        if let Some(tx) = tx
+                            && tx.try_send(msg.data).is_err()
+                        {
+                            session_senders.lock().unwrap().remove(&msg.session_id);
+                            tracing::warn!(
+                                session_id = %msg.session_id,
+                                "dropping stalled app-side terminal data receiver"
+                            );
                         }
                     }
                 }
@@ -718,11 +728,10 @@ impl DaemonClientInner {
             scrollback_limit_bytes: Some(INITIAL_ATTACH_SCROLLBACK_LIMIT_BYTES),
         };
 
-        // Register session data channel. Unbounded so the daemon-reader
-        // thread (which calls send_blocking) never stalls if the UI task
-        // hasn't drained yet — bounded would risk blocking the socket
-        // reader and stalling all sessions.
-        let (data_tx, data_rx) = async_channel::unbounded::<Vec<u8>>();
+        // Register session data channel with a bounded app-side queue so a
+        // stalled UI consumer cannot grow memory without limit.
+        let (data_tx, data_rx) =
+            async_channel::bounded::<Vec<u8>>(APP_SESSION_DATA_CHANNEL_CAPACITY);
         {
             let mut senders = inner.session_senders.lock().unwrap();
             senders.insert(session_id, data_tx);
