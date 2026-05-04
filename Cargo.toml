@@ -19,7 +19,7 @@ repository = "https://github.com/butbeautifulco/seoul-terminal"
 [workspace.dependencies]
 anyhow = "1"
 portable-pty = "0.9"
-libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs" }
+libghostty-vt = { git = "https://github.com/Uzaaft/libghostty-rs", rev = "811cbdd85a99b40a63424a9d247c4f3653c11924" }
 gpui = "0.2.2"
 futures = "0.3"
 smol = "2"

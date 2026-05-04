@@ -243,8 +243,8 @@ impl TerminalResizer for PtyResizer {
             .resize(PtySize {
                 rows,
                 cols,
-                pixel_width: pixel_width as u16,
-                pixel_height: pixel_height as u16,
+                pixel_width: pixel_width.min(u16::MAX as u32) as u16,
+                pixel_height: pixel_height.min(u16::MAX as u32) as u16,
             })
             .context("PTY resize failed")
     }

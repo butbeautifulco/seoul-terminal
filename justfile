@@ -1,7 +1,7 @@
 # Seoul — Development Workflow
 # Requires: watchexec (`cargo install watchexec-cli`)
 
-ghostty_lib_dir := `find target/debug/build -path "*ghostty-vt-sys*/out/ghostty-install/lib" 2>/dev/null | head -1`
+ghostty_lib_dir := `find target/debug/build -path "*ghostty-vt-sys*/out/ghostty-install/lib" 2>/dev/null | sort | tail -n 1`
 
 # Build all crates
 build:
