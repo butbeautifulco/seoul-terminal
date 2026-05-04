@@ -350,7 +350,7 @@ impl AppView {
         if app.daemon_client.is_some() {
             let daemon_client = app.daemon_client.take();
             for ws in app.state.workspaces.clone() {
-                if !app.restore_workspace_tabs_offline(&ws, window, cx) {
+                if !app.restore_workspace_tabs(&ws, window, cx) {
                     app.ensure_workspace_has_tab(&ws, window, cx);
                 }
             }
@@ -361,7 +361,7 @@ impl AppView {
             // Restore saved tab layout (using saved tab IDs for daemon reattach),
             // or create a fresh tab if no saved sessions exist.
             for ws in app.state.workspaces.clone() {
-                if !app.restore_workspace_tabs_offline(&ws, window, cx) {
+                if !app.restore_workspace_tabs(&ws, window, cx) {
                     app.ensure_workspace_has_tab(&ws, window, cx);
                 }
             }
@@ -1247,17 +1247,6 @@ impl AppView {
         }
 
         true
-    }
-
-    /// Restore saved tab layout with pending terminals (no PTY, no shell process).
-    /// Uses saved tab IDs so background reattach can attach in-place later.
-    fn restore_workspace_tabs_offline(
-        &mut self,
-        workspace: &Workspace,
-        window: &mut Window,
-        cx: &mut Context<Self>,
-    ) -> bool {
-        self.restore_workspace_tabs(workspace, window, cx)
     }
 
     fn ensure_workspace_has_tab(

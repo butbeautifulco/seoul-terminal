@@ -106,6 +106,16 @@ impl Frame {
 
     /// Encode the frame into wire format: [type:1][len:4 LE][payload].
     pub fn encode(&self, writer: &mut impl Write) -> io::Result<()> {
+        if self.payload.len() > MAX_FRAME_SIZE {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!(
+                    "frame payload too large: {} bytes (max {})",
+                    self.payload.len(),
+                    MAX_FRAME_SIZE
+                ),
+            ));
+        }
         let header = encode_header(self.message_type, self.payload.len() as u32);
         writer.write_all(&header)?;
         writer.write_all(&self.payload)?;

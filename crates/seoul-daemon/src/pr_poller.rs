@@ -220,7 +220,6 @@ async fn poll_due(
     for id in due_ids {
         poll_one(id, state, octo, broadcast_tx).await;
     }
-    let _ = octo;
 }
 
 async fn poll_one(

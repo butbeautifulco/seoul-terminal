@@ -108,6 +108,9 @@ pub fn commit(runner: &GitCommandRunner, message: &str) -> Result<String> {
 pub fn push(runner: &GitCommandRunner, set_upstream: bool) -> Result<()> {
     if set_upstream {
         let branch = runner.run(&["rev-parse", "--abbrev-ref", "HEAD"])?;
+        if branch == "HEAD" {
+            bail!("cannot push: HEAD is detached (not on a branch)");
+        }
         runner.run(&["push", "--set-upstream", "origin", &branch])?;
     } else {
         runner.run(&["push"])?;

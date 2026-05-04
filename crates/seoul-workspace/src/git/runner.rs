@@ -1,6 +1,5 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
 
@@ -17,14 +16,12 @@ pub struct CommandOutput {
 /// All commands are executed with `current_dir` set to `repo_path`.
 pub struct GitCommandRunner {
     repo_path: PathBuf,
-    timeout: Duration,
 }
 
 impl GitCommandRunner {
     pub fn new(repo_path: impl Into<PathBuf>) -> Self {
         Self {
             repo_path: repo_path.into(),
-            timeout: Duration::from_secs(30),
         }
     }
 
@@ -64,12 +61,6 @@ impl GitCommandRunner {
         })
     }
 
-    /// Run a git command with a timeout.
-    pub fn with_timeout(mut self, timeout: Duration) -> Self {
-        self.timeout = timeout;
-        self
-    }
-
     /// Run a git command and return stdout as raw bytes.
     /// Fails if the command exits with non-zero status.
     pub fn run_bytes(&self, args: &[&str]) -> Result<Vec<u8>> {
@@ -89,7 +80,6 @@ impl Clone for GitCommandRunner {
     fn clone(&self) -> Self {
         Self {
             repo_path: self.repo_path.clone(),
-            timeout: self.timeout,
         }
     }
 }
