@@ -121,7 +121,7 @@ fn wide_tail_cursor_is_rendered_at_wide_head() {
 fn mouse_encoder_tracks_size_and_button_state() {
     let (mut term, captured) = terminal();
 
-    term.feed_pty_data(b"\x1b[?1000h\x1b[?1006h");
+    term.feed_pty_data(b"\x1b[?1003h\x1b[?1006h");
     term.set_mouse_size(mouse::EncoderSize {
         screen_width: 800,
         screen_height: 400,
@@ -132,7 +132,6 @@ fn mouse_encoder_tracks_size_and_button_state() {
         padding_right: 0,
         padding_left: 0,
     });
-    term.set_mouse_any_button_pressed(true);
     term.send_mouse_event(
         mouse::Action::Press,
         Some(mouse::Button::Left),
@@ -140,6 +139,16 @@ fn mouse_encoder_tracks_size_and_button_state() {
         15.0,
         25.0,
     );
+    assert_eq!(take(&captured), b"\x1b[<0;2;2M");
 
-    assert!(!take(&captured).is_empty());
+    term.set_mouse_any_button_pressed(true);
+    term.send_mouse_event(
+        mouse::Action::Motion,
+        Some(mouse::Button::Left),
+        key::Mods::empty(),
+        -1.0,
+        -1.0,
+    );
+
+    assert_eq!(take(&captured), b"\x1b[<32;1;1M");
 }
