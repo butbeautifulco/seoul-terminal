@@ -1,0 +1,23 @@
+# Rust
+/target
+
+# Claude Code - local/personal
+.claude/settings.local.json
+.claude/plans/
+.claude/memory/
+.claude/worktrees/
+.claude/agent-memory-local/
+CLAUDE.local.md
+
+# Installed skills (reproducible from skills-lock.json)
+.agents/
+.claude/skills/
+
+# Serena MCP - local project memory/cache
+.serena/
+
+# Internal product spec — not for public mirror
+PRD.md
+
+# Per-developer skill manifest
+skills-lock.json

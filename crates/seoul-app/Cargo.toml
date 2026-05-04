@@ -1,0 +1,73 @@
+[package]
+name = "seoul-app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+repository.workspace = true
+
+[[bin]]
+name = "seoul"
+path = "src/main.rs"
+
+[lints]
+workspace = true
+
+[dependencies]
+anyhow.workspace = true
+gpui.workspace = true
+libc.workspace = true
+gpui_platform = { git = "https://github.com/zed-industries/zed", features = ["font-kit"] }
+rust-embed.workspace = true
+portable-pty.workspace = true
+libghostty-vt.workspace = true
+seoul-terminal = { path = "../seoul-terminal" }
+seoul-terminal-proto = { path = "../seoul-terminal-proto" }
+seoul-workspace = { path = "../seoul-workspace" }
+async-channel.workspace = true
+futures.workspace = true
+smol.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+unicode-width.workspace = true
+unicode-segmentation.workspace = true
+streaming-iterator.workspace = true
+uuid.workspace = true
+dirs.workspace = true
+notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+ropey.workspace = true
+tree-sitter.workspace = true
+tree-sitter-language.workspace = true
+tree-sitter-rust.workspace = true
+tree-sitter-javascript.workspace = true
+tree-sitter-json.workspace = true
+tree-sitter-toml-ng.workspace = true
+tree-sitter-python.workspace = true
+tree-sitter-typescript.workspace = true
+tree-sitter-c.workspace = true
+tree-sitter-cpp.workspace = true
+tree-sitter-go.workspace = true
+tree-sitter-css.workspace = true
+tree-sitter-html.workspace = true
+tree-sitter-bash.workspace = true
+tree-sitter-yaml.workspace = true
+tree-sitter-md.workspace = true
+tree-sitter-ruby.workspace = true
+tree-sitter-java.workspace = true
+tree-sitter-swift.workspace = true
+tree-sitter-php.workspace = true
+tree-sitter-lua.workspace = true
+tree-sitter-scala.workspace = true
+tree-sitter-haskell.workspace = true
+tree-sitter-elixir.workspace = true
+tree-sitter-zig.workspace = true
+tree-sitter-r.workspace = true
+tree-sitter-dart.workspace = true
+tree-sitter-ocaml.workspace = true
+tree-sitter-c-sharp.workspace = true
+tree-sitter-kotlin.workspace = true  # Rust API incompatible; used only to compile & link C grammar
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }

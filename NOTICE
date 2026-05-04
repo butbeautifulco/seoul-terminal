@@ -1,0 +1,17 @@
+Seoul Terminal
+Copyright 2026 But Beautiful Co.
+
+This product is licensed under the Apache License, Version 2.0
+(see LICENSE).
+
+Portions of the design draw on architectural patterns from the
+Zed editor (https://github.com/zed-industries/zed). Specifically,
+the splittable pane tree (crates/seoul-app/src/pane_group.rs),
+the tab item trait (crates/seoul-app/src/item.rs), and the
+coalescing PTY-read loop (crates/seoul-app/src/terminal_view.rs)
+were inspired by the corresponding ideas in Zed. The implementations
+in this repository were written from scratch and do not include
+copied source from Zed. Inline source comments mark each location.
+
+The `gpui` and `gpui_platform` crates from Zed, which this project
+depends on, are themselves licensed under the Apache License, Version 2.0.
