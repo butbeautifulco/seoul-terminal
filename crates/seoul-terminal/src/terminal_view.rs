@@ -1254,6 +1254,19 @@ impl TerminalView {
         }
     }
 
+    fn terminal_surface_position(
+        position: gpui::Point<Pixels>,
+        bounds: Option<Bounds<Pixels>>,
+    ) -> (f32, f32) {
+        let origin = bounds
+            .map(|bounds| bounds.origin)
+            .unwrap_or(point(Pixels::ZERO, Pixels::ZERO));
+        (
+            f32::from(position.x - origin.x),
+            f32::from(position.y - origin.y),
+        )
+    }
+
     fn on_terminal_mouse_down(
         &mut self,
         event: &MouseDownEvent,
@@ -1271,12 +1284,14 @@ impl TerminalView {
         self.terminal.set_mouse_any_button_pressed(true);
         self.terminal.set_mouse_track_last_cell(true);
         if self.terminal.is_mouse_tracking() {
+            let (pos_x, pos_y) =
+                Self::terminal_surface_position(event.position, self.element_bounds.get());
             self.terminal.send_mouse_event(
                 mouse::Action::Press,
                 Some(button),
                 Self::mouse_mods(event.modifiers),
-                f32::from(event.position.x),
-                f32::from(event.position.y),
+                pos_x,
+                pos_y,
             );
             self.show_cursor_now(cx);
             cx.notify();
@@ -1299,12 +1314,14 @@ impl TerminalView {
         self.terminal.set_mouse_any_button_pressed(false);
         self.terminal.set_mouse_track_last_cell(true);
         if self.terminal.is_mouse_tracking() {
+            let (pos_x, pos_y) =
+                Self::terminal_surface_position(event.position, self.element_bounds.get());
             self.terminal.send_mouse_event(
                 mouse::Action::Release,
                 Some(button),
                 Self::mouse_mods(event.modifiers),
-                f32::from(event.position.x),
-                f32::from(event.position.y),
+                pos_x,
+                pos_y,
             );
             self.show_cursor_now(cx);
             cx.notify();
@@ -1324,12 +1341,14 @@ impl TerminalView {
             .set_mouse_any_button_pressed(self.mouse_button_pressed);
         self.terminal.set_mouse_track_last_cell(true);
         let button = event.pressed_button.and_then(Self::ghostty_mouse_button);
+        let (pos_x, pos_y) =
+            Self::terminal_surface_position(event.position, self.element_bounds.get());
         self.terminal.send_mouse_event(
             mouse::Action::Motion,
             button,
             Self::mouse_mods(event.modifiers),
-            f32::from(event.position.x),
-            f32::from(event.position.y),
+            pos_x,
+            pos_y,
         );
         if self.mouse_button_pressed {
             self.show_cursor_now(cx);
@@ -1743,8 +1762,8 @@ impl Render for TerminalView {
                     } else {
                         (mouse::Button::Five, -delta_lines) // scroll down
                     };
-                    let pos_x: f32 = event.position.x.into();
-                    let pos_y: f32 = event.position.y.into();
+                    let (pos_x, pos_y) =
+                        Self::terminal_surface_position(event.position, this.element_bounds.get());
                     for _ in 0..count.min(5) {
                         this.terminal.send_mouse_event(
                             mouse::Action::Press,
