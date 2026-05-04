@@ -3,6 +3,7 @@ use std::rc::Rc;
 
 use gpui::*;
 use libghostty_vt::render::CursorVisualStyle;
+use libghostty_vt::style::RgbColor;
 use seoul_vt::config::TerminalConfig;
 use seoul_vt::terminal::TerminalContent;
 
@@ -25,7 +26,7 @@ pub fn render_terminal(
 
     let theme = &config.theme;
     let cursor_bg_hex = theme.cursor.to_u32();
-    let cursor_glyph_fg = Hsla::from(rgb(theme.background.to_u32()));
+    let cursor_glyph_fg = rgb_to_hsla(content.bg_color);
     let font_family: SharedString = config.font_family.clone().into();
     let font_size = config.font_size;
 
@@ -293,4 +294,9 @@ fn paint_run_text(
     } else {
         let _ = shaped.paint(position, px(ch), TextAlign::Left, None, window, cx);
     }
+}
+
+fn rgb_to_hsla(c: RgbColor) -> Hsla {
+    let v = ((c.r as u32) << 24) | ((c.g as u32) << 16) | ((c.b as u32) << 8) | 0xff;
+    Hsla::from(rgba(v))
 }

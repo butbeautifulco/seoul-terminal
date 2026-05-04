@@ -14,13 +14,14 @@ pub struct CachedCellRun {
     pub italic: bool,
     pub underline: bool,
     pub strikethrough: bool,
+    #[allow(dead_code)]
     pub faint: bool,
     pub has_wide: bool,
 }
 
 #[derive(Default)]
 struct CachedRow {
-    generation: u64,
+    generation: Option<u64>,
     runs: Vec<CachedCellRun>,
 }
 
@@ -43,14 +44,16 @@ impl TerminalRenderCache {
         for row_idx in 0..content.cells.len() {
             let row_dirty = full_refresh
                 || content.dirty_rows.contains(&(row_idx as u16))
-                || self.rows[row_idx].generation == 0;
+                || self.rows[row_idx].generation.is_none();
             if row_dirty {
                 self.rows[row_idx].runs = build_runs_for_row(&content.cells[row_idx]);
-                self.rows[row_idx].generation = content.content_generation;
+                self.rows[row_idx].generation = Some(content.content_generation);
             }
         }
         self.last_generation = content.content_generation;
 
+        // Reserved for future render-cache behavior that depends on terminal
+        // configuration; kept in the signature so callers do not change again.
         let _ = config;
     }
 
@@ -60,7 +63,22 @@ impl TerminalRenderCache {
 }
 
 fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
-    let mut runs: Vec<CachedCellRun> = Vec::new();
+    #[derive(Default)]
+    struct PendingCellRun {
+        text: String,
+        fg: Hsla,
+        bg: Hsla,
+        col_start: u16,
+        cols: u16,
+        bold: bool,
+        italic: bool,
+        underline: bool,
+        strikethrough: bool,
+        faint: bool,
+        has_wide: bool,
+    }
+
+    let mut runs: Vec<PendingCellRun> = Vec::new();
     for cell in row_cells {
         if matches!(
             cell.wide,
@@ -80,12 +98,6 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
         };
         let is_wide = cell.wide == CellWidthKind::Wide;
 
-        let text = if cell.graphemes.is_empty() || cell.graphemes.as_slice() == [' '] {
-            " ".to_string()
-        } else {
-            cell.graphemes.iter().collect()
-        };
-
         if !is_wide
             && let Some(last) = runs.last_mut()
             && !last.has_wide
@@ -97,15 +109,15 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
             && last.strikethrough == cell.strikethrough
             && last.faint == cell.faint
         {
-            let mut merged = last.text.to_string();
-            merged.push_str(&text);
-            last.text = SharedString::from(merged);
+            append_cell_text(&mut last.text, cell);
             last.cols = last.cols.saturating_add(1);
             continue;
         }
 
-        runs.push(CachedCellRun {
-            text: SharedString::from(text),
+        let mut text = String::new();
+        append_cell_text(&mut text, cell);
+        runs.push(PendingCellRun {
+            text,
             fg,
             bg,
             col_start: cell.col,
@@ -118,7 +130,32 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
             has_wide: is_wide,
         });
     }
-    runs
+
+    runs.into_iter()
+        .map(|run| CachedCellRun {
+            text: SharedString::from(run.text),
+            fg: run.fg,
+            bg: run.bg,
+            col_start: run.col_start,
+            cols: run.cols,
+            bold: run.bold,
+            italic: run.italic,
+            underline: run.underline,
+            strikethrough: run.strikethrough,
+            faint: run.faint,
+            has_wide: run.has_wide,
+        })
+        .collect()
+}
+
+fn append_cell_text(text: &mut String, cell: &RenderedCell) {
+    if cell.graphemes.is_empty() || cell.graphemes.as_slice() == [' '] {
+        text.push(' ');
+    } else {
+        for grapheme in &cell.graphemes {
+            text.push(*grapheme);
+        }
+    }
 }
 
 fn rgb_to_hsla(c: RgbColor) -> Hsla {
@@ -134,10 +171,10 @@ mod tests {
 
     use super::TerminalRenderCache;
 
-    fn cell(col: u16, grapheme: char, wide: CellWidthKind) -> RenderedCell {
+    fn cell(row: u16, col: u16, grapheme: char, wide: CellWidthKind) -> RenderedCell {
         RenderedCell {
             col,
-            row: 0,
+            row,
             graphemes: [grapheme].into_iter().collect(),
             fg: RgbColor {
                 r: 255,
@@ -154,23 +191,39 @@ mod tests {
         }
     }
 
-    #[test]
-    fn update_skips_wide_spacers_and_keeps_wide_run_width() {
-        let content = TerminalContent {
-            cells: vec![vec![
-                cell(0, '界', CellWidthKind::Wide),
-                cell(1, ' ', CellWidthKind::SpacerTail),
-                cell(2, 'x', CellWidthKind::Narrow),
-            ]],
+    fn content(
+        rows: Vec<Vec<RenderedCell>>,
+        generation: u64,
+        dirty_rows: Vec<u16>,
+    ) -> TerminalContent {
+        TerminalContent {
             terminal_bounds: TerminalBounds {
-                cols: 3,
-                rows: 1,
+                cols: rows.iter().map(Vec::len).max().unwrap_or_default() as u16,
+                rows: rows.len() as u16,
                 ..TerminalBounds::default()
             },
-            content_generation: 1,
-            dirty_rows: vec![0],
+            cells: rows,
+            content_generation: generation,
+            dirty_rows,
             ..TerminalContent::default()
-        };
+        }
+    }
+
+    fn row_text(cache: &TerminalRenderCache, row_idx: usize) -> String {
+        cache.rows().nth(row_idx).unwrap()[0].text.to_string()
+    }
+
+    #[test]
+    fn update_skips_wide_spacers_and_keeps_wide_run_width() {
+        let content = content(
+            vec![vec![
+                cell(0, 0, '界', CellWidthKind::Wide),
+                cell(0, 1, ' ', CellWidthKind::SpacerTail),
+                cell(0, 2, 'x', CellWidthKind::Narrow),
+            ]],
+            1,
+            vec![0],
+        );
 
         let mut cache = TerminalRenderCache::default();
         cache.update(&content, &TerminalConfig::default());
@@ -185,5 +238,144 @@ mod tests {
         assert_eq!(rows[0][1].text.as_ref(), "x");
         assert_eq!(rows[0][1].col_start, 2);
         assert_eq!(rows[0][1].cols, 1);
+    }
+
+    #[test]
+    fn generation_change_with_no_dirty_rows_rebuilds_all_rows() {
+        let mut cache = TerminalRenderCache::default();
+        cache.update(
+            &content(
+                vec![
+                    vec![cell(0, 0, 'a', CellWidthKind::Narrow)],
+                    vec![cell(1, 0, 'b', CellWidthKind::Narrow)],
+                ],
+                1,
+                vec![0, 1],
+            ),
+            &TerminalConfig::default(),
+        );
+
+        cache.update(
+            &content(
+                vec![
+                    vec![cell(0, 0, 'x', CellWidthKind::Narrow)],
+                    vec![cell(1, 0, 'y', CellWidthKind::Narrow)],
+                ],
+                2,
+                Vec::new(),
+            ),
+            &TerminalConfig::default(),
+        );
+
+        assert_eq!(row_text(&cache, 0), "x");
+        assert_eq!(row_text(&cache, 1), "y");
+    }
+
+    #[test]
+    fn dirty_update_rebuilds_only_dirty_rows() {
+        let mut cache = TerminalRenderCache::default();
+        cache.update(
+            &content(
+                vec![
+                    vec![cell(0, 0, 'a', CellWidthKind::Narrow)],
+                    vec![cell(1, 0, 'b', CellWidthKind::Narrow)],
+                ],
+                1,
+                vec![0, 1],
+            ),
+            &TerminalConfig::default(),
+        );
+
+        cache.update(
+            &content(
+                vec![
+                    vec![cell(0, 0, 'x', CellWidthKind::Narrow)],
+                    vec![cell(1, 0, 'y', CellWidthKind::Narrow)],
+                ],
+                2,
+                vec![1],
+            ),
+            &TerminalConfig::default(),
+        );
+
+        assert_eq!(row_text(&cache, 0), "a");
+        assert_eq!(row_text(&cache, 1), "y");
+    }
+
+    #[test]
+    fn clean_cursor_only_frame_does_not_rebuild_cached_text() {
+        let mut cache = TerminalRenderCache::default();
+        cache.update(
+            &content(
+                vec![vec![cell(0, 0, 'a', CellWidthKind::Narrow)]],
+                1,
+                vec![0],
+            ),
+            &TerminalConfig::default(),
+        );
+
+        cache.update(
+            &content(
+                vec![vec![cell(0, 0, 'x', CellWidthKind::Narrow)]],
+                1,
+                Vec::new(),
+            ),
+            &TerminalConfig::default(),
+        );
+
+        assert_eq!(row_text(&cache, 0), "a");
+    }
+
+    #[test]
+    fn row_count_change_resets_cached_geometry() {
+        let mut cache = TerminalRenderCache::default();
+        cache.update(
+            &content(
+                vec![
+                    vec![cell(0, 0, 'a', CellWidthKind::Narrow)],
+                    vec![cell(1, 0, 'b', CellWidthKind::Narrow)],
+                ],
+                1,
+                vec![0, 1],
+            ),
+            &TerminalConfig::default(),
+        );
+
+        cache.update(
+            &content(
+                vec![vec![cell(0, 0, 'x', CellWidthKind::Narrow)]],
+                1,
+                Vec::new(),
+            ),
+            &TerminalConfig::default(),
+        );
+
+        let rows: Vec<_> = cache.rows().collect();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0][0].text.as_ref(), "x");
+    }
+
+    #[test]
+    fn generation_zero_initializes_once_without_rebuilding_clean_frames() {
+        let mut cache = TerminalRenderCache::default();
+        cache.update(
+            &content(
+                vec![vec![cell(0, 0, 'a', CellWidthKind::Narrow)]],
+                0,
+                Vec::new(),
+            ),
+            &TerminalConfig::default(),
+        );
+
+        cache.update(
+            &content(
+                vec![vec![cell(0, 0, 'x', CellWidthKind::Narrow)]],
+                0,
+                Vec::new(),
+            ),
+            &TerminalConfig::default(),
+        );
+
+        assert_eq!(row_text(&cache, 0), "a");
     }
 }
