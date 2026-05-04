@@ -315,10 +315,8 @@ impl Terminal {
             .set_key(key)
             .set_mods(mods)
             .set_consumed_mods(key::Mods::empty())
-            .set_composing(false);
-        if let Some(ch) = unshifted {
-            self.key_event.set_unshifted_codepoint(ch);
-        }
+            .set_composing(false)
+            .set_unshifted_codepoint(unshifted.unwrap_or('\0'));
 
         if let Some(text) = utf8 {
             self.key_event.set_utf8(Some(text));
