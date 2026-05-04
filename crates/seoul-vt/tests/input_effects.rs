@@ -77,7 +77,10 @@ fn title_bell_queries_and_size_effects_work() {
     assert_eq!(take(&captured), b"seoul");
 
     term.feed_pty_data(b"\x1b[>0q");
-    assert_eq!(take(&captured), b"\x1bP>|seoul 0.1.0\x1b\\");
+    assert_eq!(
+        take(&captured),
+        format!("\x1bP>|seoul {}\x1b\\", env!("CARGO_PKG_VERSION")).into_bytes()
+    );
 
     term.resize(TerminalBounds {
         cols: 80,
@@ -92,7 +95,7 @@ fn title_bell_queries_and_size_effects_work() {
 
 #[test]
 fn silent_replay_does_not_mutate_user_visible_effects() {
-    let (mut term, _captured) = terminal();
+    let (mut term, captured) = terminal();
 
     term.feed_pty_data(b"\x1b]2;Live\x07\x07");
     term.sync();
@@ -103,6 +106,17 @@ fn silent_replay_does_not_mutate_user_visible_effects() {
     term.sync();
     assert_eq!(term.breadcrumb_text(), "Live");
     assert_eq!(term.last_content.bell_count, 1);
+
+    term.resize(TerminalBounds {
+        cols: 80,
+        rows: 24,
+        cell_width: 9.0,
+        line_height: 18.0,
+    })
+    .unwrap();
+
+    term.feed_pty_data_silently(b"\x05\x1b[c\x1b[5n\x1b[18t");
+    assert!(take(&captured).is_empty());
 }
 
 #[test]

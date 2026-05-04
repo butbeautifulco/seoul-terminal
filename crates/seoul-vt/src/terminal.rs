@@ -173,6 +173,58 @@ pub enum SelectionPhase {
 /// The shared PTY writer handle, used by callbacks and input methods.
 pub type SharedWriter = Arc<Mutex<Box<dyn Write + Send>>>;
 
+struct SilentReplayGuard {
+    pty_writer: SharedWriter,
+    real_writer: Option<Box<dyn Write + Send>>,
+    effect_state: Arc<Mutex<effects::TerminalEffectState>>,
+    previous_suppression: Option<bool>,
+}
+
+impl SilentReplayGuard {
+    fn new(
+        pty_writer: SharedWriter,
+        effect_state: Arc<Mutex<effects::TerminalEffectState>>,
+    ) -> Self {
+        let real_writer = {
+            let mut writer = pty_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            std::mem::replace(&mut *writer, Box::new(std::io::sink()))
+        };
+        let previous_suppression = if let Ok(mut state) = effect_state.lock() {
+            let previous = Some(state.suppress_side_effects);
+            state.suppress_side_effects = true;
+            previous
+        } else {
+            None
+        };
+
+        Self {
+            pty_writer,
+            real_writer: Some(real_writer),
+            effect_state,
+            previous_suppression,
+        }
+    }
+}
+
+impl Drop for SilentReplayGuard {
+    fn drop(&mut self) {
+        if let Some(previous) = self.previous_suppression
+            && let Ok(mut state) = self.effect_state.lock()
+        {
+            state.suppress_side_effects = previous;
+        }
+        if let Some(real_writer) = self.real_writer.take() {
+            let mut writer = self
+                .pty_writer
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            *writer = real_writer;
+        }
+    }
+}
+
 // ── TerminalResizer trait ────────────────────────────────────
 
 /// Abstraction for resizing the backing PTY or sending a resize message to the daemon.
@@ -335,27 +387,8 @@ impl Terminal {
     /// Feed PTY output data without sending VT responses back to the PTY.
     /// Used for scrollback replay where DA/DSR responses must be suppressed.
     pub fn feed_pty_data_silently(&mut self, data: &[u8]) {
-        let real_writer = {
-            let mut w = self.pty_writer.lock().unwrap();
-            std::mem::replace(&mut *w, Box::new(std::io::sink()))
-        };
-        let previous_suppression = if let Ok(mut state) = self.effect_state.lock() {
-            let previous = Some(state.suppress_side_effects);
-            state.suppress_side_effects = true;
-            previous
-        } else {
-            None
-        };
+        let _guard = SilentReplayGuard::new(self.pty_writer.clone(), self.effect_state.clone());
         self.ghostty.vt_write(data);
-        if let Some(previous) = previous_suppression
-            && let Ok(mut state) = self.effect_state.lock()
-        {
-            state.suppress_side_effects = previous;
-        }
-        {
-            let mut w = self.pty_writer.lock().unwrap();
-            *w = real_writer;
-        }
     }
 
     /// Scroll the viewport.
