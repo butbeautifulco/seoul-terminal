@@ -10,6 +10,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::{Context, Result, bail};
+use async_channel::TrySendError;
 use uuid::Uuid;
 
 use seoul_terminal_proto::frame::{Frame, MessageType};
@@ -84,6 +85,22 @@ type ResizeAckSenders = Arc<Mutex<HashMap<SessionId, async_channel::Sender<(u16,
 type PendingRequests = Arc<Mutex<HashMap<SessionId, mpsc::Sender<Frame>>>>;
 const INITIAL_ATTACH_SCROLLBACK_LIMIT_BYTES: usize = 128 * 1024;
 const APP_SESSION_DATA_CHANNEL_CAPACITY: usize = 512;
+
+fn remove_session_sender_if_same(
+    session_senders: &SessionSenders,
+    session_id: SessionId,
+    failed_tx: &async_channel::Sender<Vec<u8>>,
+) -> bool {
+    let mut senders = session_senders.lock().unwrap();
+    if senders
+        .get(&session_id)
+        .is_some_and(|current| current.same_channel(failed_tx))
+    {
+        senders.remove(&session_id);
+        return true;
+    }
+    false
+}
 
 /// Messages enqueued for the central daemon-writer thread.
 /// All daemon-bound IPC routes through this enum so that encode/lock/flush
@@ -608,11 +625,18 @@ impl DaemonClient {
                             senders.get(&msg.session_id).cloned()
                         };
                         if let Some(tx) = tx
-                            && tx.try_send(msg.data).is_err()
+                            && let Err(err) = tx.try_send(msg.data)
                         {
-                            session_senders.lock().unwrap().remove(&msg.session_id);
+                            let reason = match err {
+                                TrySendError::Full(_) => "full",
+                                TrySendError::Closed(_) => "closed",
+                            };
+                            let removed =
+                                remove_session_sender_if_same(&session_senders, msg.session_id, &tx);
                             tracing::warn!(
                                 session_id = %msg.session_id,
+                                reason,
+                                removed,
                                 "dropping stalled app-side terminal data receiver"
                             );
                         }
@@ -830,5 +854,51 @@ impl DaemonClientInner {
         }
 
         response.decode_msg()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stale_sender_removal_keeps_replacement_sender() {
+        let session_id = Uuid::new_v4();
+        let session_senders = Arc::new(Mutex::new(HashMap::new()));
+        let (old_tx, _old_rx) = async_channel::bounded::<Vec<u8>>(1);
+        let stale_tx = old_tx.clone();
+        let (new_tx, _new_rx) = async_channel::bounded::<Vec<u8>>(1);
+
+        session_senders.lock().unwrap().insert(session_id, old_tx);
+        session_senders.lock().unwrap().insert(session_id, new_tx.clone());
+
+        assert!(!remove_session_sender_if_same(
+            &session_senders,
+            session_id,
+            &stale_tx
+        ));
+        let current = session_senders
+            .lock()
+            .unwrap()
+            .get(&session_id)
+            .cloned()
+            .expect("replacement sender should remain");
+        assert!(current.same_channel(&new_tx));
+    }
+
+    #[test]
+    fn stale_sender_removal_removes_matching_sender() {
+        let session_id = Uuid::new_v4();
+        let session_senders = Arc::new(Mutex::new(HashMap::new()));
+        let (tx, _rx) = async_channel::bounded::<Vec<u8>>(1);
+
+        session_senders.lock().unwrap().insert(session_id, tx.clone());
+
+        assert!(remove_session_sender_if_same(
+            &session_senders,
+            session_id,
+            &tx
+        ));
+        assert!(!session_senders.lock().unwrap().contains_key(&session_id));
     }
 }
