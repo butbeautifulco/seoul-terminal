@@ -1089,18 +1089,30 @@ impl TerminalView {
         let Some(bounds) = self.element_bounds.get() else {
             return;
         };
-        let pad = self.config.padding.round().max(0.0) as u32;
-        self.terminal.set_mouse_size(mouse::EncoderSize {
-            screen_width: f32::from(bounds.size.width).round().max(1.0) as u32,
-            screen_height: f32::from(bounds.size.height).round().max(1.0) as u32,
-            cell_width: self.cell_width.round().max(1.0) as u32,
-            cell_height: self.cell_height.round().max(1.0) as u32,
-            padding_top: pad,
-            padding_bottom: pad,
-            padding_right: pad,
-            padding_left: pad,
-        });
+        self.terminal
+            .set_mouse_size(Self::mouse_encoder_size_for_content_bounds(
+                bounds.size,
+                self.cell_width,
+                self.cell_height,
+            ));
         self.terminal.set_mouse_track_last_cell(true);
+    }
+
+    fn mouse_encoder_size_for_content_bounds(
+        size: Size<Pixels>,
+        cell_width: f32,
+        cell_height: f32,
+    ) -> mouse::EncoderSize {
+        mouse::EncoderSize {
+            screen_width: f32::from(size.width).round().max(1.0) as u32,
+            screen_height: f32::from(size.height).round().max(1.0) as u32,
+            cell_width: cell_width.round().max(1.0) as u32,
+            cell_height: cell_height.round().max(1.0) as u32,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        }
     }
 
     /// Spawn the ResizeAck drain task.
@@ -1566,7 +1578,7 @@ impl crate::item::Item for TerminalView {
 #[cfg(test)]
 mod tests {
     use super::TerminalView;
-    use gpui::Keystroke;
+    use gpui::{Keystroke, px, size};
     use libghostty_vt::key as gkey;
 
     fn keystroke(key: &str) -> Keystroke {
@@ -1609,6 +1621,21 @@ mod tests {
             TerminalView::map_keystroke(&ctrl_keystroke("A")),
             Some((gkey::Key::A, _, _, Some('a')))
         ));
+    }
+
+    #[test]
+    fn mouse_encoder_size_for_content_bounds_uses_content_size_and_zero_padding() {
+        let encoder_size =
+            TerminalView::mouse_encoder_size_for_content_bounds(size(px(80.4), px(24.6)), 7.6, 0.2);
+
+        assert_eq!(encoder_size.screen_width, 80);
+        assert_eq!(encoder_size.screen_height, 25);
+        assert_eq!(encoder_size.cell_width, 8);
+        assert_eq!(encoder_size.cell_height, 1);
+        assert_eq!(encoder_size.padding_top, 0);
+        assert_eq!(encoder_size.padding_bottom, 0);
+        assert_eq!(encoder_size.padding_left, 0);
+        assert_eq!(encoder_size.padding_right, 0);
     }
 }
 
