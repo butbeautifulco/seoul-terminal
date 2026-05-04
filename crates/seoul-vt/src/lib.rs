@@ -1,4 +1,5 @@
 pub mod config;
+mod effects;
 pub mod terminal;
 
 pub use libghostty_vt;

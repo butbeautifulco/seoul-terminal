@@ -5,12 +5,13 @@ use anyhow::{Context, Result};
 use libghostty_vt::render::{CellIterator, CursorVisualStyle, Dirty, RenderState, RowIterator};
 use libghostty_vt::screen::CellWide;
 use libghostty_vt::style::RgbColor;
-use libghostty_vt::terminal::ScrollViewport;
-use libghostty_vt::{Terminal as GhosttyTerminal, TerminalOptions, key, mouse};
+use libghostty_vt::terminal::{Mode, ScrollViewport};
+use libghostty_vt::{Terminal as GhosttyTerminal, TerminalOptions, focus, key, mouse, paste};
 use portable_pty::{CommandBuilder, MasterPty, PtySize, native_pty_system};
 use smallvec::SmallVec;
 
 use crate::config::TerminalConfig;
+use crate::effects;
 
 /// Terminal bounds in pixel and cell dimensions.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -131,6 +132,9 @@ pub struct TerminalContent {
     pub cursor_color: Option<RgbColor>,
     pub terminal_bounds: TerminalBounds,
     pub scrollbar: Option<ScrollbarState>,
+    pub bell_count: u64,
+    pub dirty_rows: Vec<u16>,
+    pub content_generation: u64,
 }
 
 impl Default for TerminalContent {
@@ -151,6 +155,9 @@ impl Default for TerminalContent {
             cursor_color: None,
             terminal_bounds: TerminalBounds::default(),
             scrollbar: None,
+            bell_count: 0,
+            dirty_rows: Vec::new(),
+            content_generation: 0,
         }
     }
 }
@@ -226,6 +233,7 @@ pub struct Terminal {
     mouse_encoder: mouse::Encoder<'static>,
     key_event: key::Event<'static>,
     mouse_event: mouse::Event<'static>,
+    effect_state: Arc<Mutex<effects::TerminalEffectState>>,
 
     pty_writer: SharedWriter,
     resizer: Box<dyn TerminalResizer>,
@@ -283,21 +291,40 @@ impl Terminal {
         self.write_to_pty(data);
     }
 
-    /// Paste text with bracketed paste support.
-    pub fn paste(&mut self, text: &str) {
-        let is_bracketed = self
-            .ghostty
-            .mode(libghostty_vt::terminal::Mode::BRACKETED_PASTE)
-            .unwrap_or(false);
+    /// Check whether Ghostty considers paste text safe.
+    pub fn paste_is_safe(text: &str) -> bool {
+        paste::is_safe(text)
+    }
 
-        if is_bracketed {
-            let escaped = text.replace('\x1b', "");
-            let paste_data = format!("\x1b[200~{}\x1b[201~", escaped);
-            self.input(paste_data.as_bytes());
-        } else {
-            let normalized = text.replace("\r\n", "\r").replace('\n', "\r");
-            self.input(normalized.as_bytes());
+    /// Paste text using Ghostty's sanitizer and bracketed paste encoder.
+    pub fn paste(&mut self, text: &str) {
+        if !Self::paste_is_safe(text) {
+            tracing::warn!("pasting text that Ghostty marks unsafe; sanitizer will be applied");
         }
+
+        let bracketed = self.ghostty.mode(Mode::BRACKETED_PASTE).unwrap_or(false);
+        let mut input = text.as_bytes().to_vec();
+        let mut out = vec![0; input.len() + 32];
+
+        let written = match paste::encode(&mut input, bracketed, &mut out) {
+            Ok(written) => written,
+            Err(libghostty_vt::Error::OutOfSpace { required }) => {
+                out.resize(required, 0);
+                match paste::encode(&mut input, bracketed, &mut out) {
+                    Ok(written) => written,
+                    Err(e) => {
+                        tracing::warn!("ghostty paste encode failed after resize: {e}");
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                tracing::warn!("ghostty paste encode failed: {e}");
+                return;
+            }
+        };
+
+        self.input(&out[..written]);
     }
 
     /// Feed PTY output data into the terminal emulator.
@@ -312,7 +339,19 @@ impl Terminal {
             let mut w = self.pty_writer.lock().unwrap();
             std::mem::replace(&mut *w, Box::new(std::io::sink()))
         };
+        let previous_suppression = if let Ok(mut state) = self.effect_state.lock() {
+            let previous = Some(state.suppress_side_effects);
+            state.suppress_side_effects = true;
+            previous
+        } else {
+            None
+        };
         self.ghostty.vt_write(data);
+        if let Some(previous) = previous_suppression
+            && let Ok(mut state) = self.effect_state.lock()
+        {
+            state.suppress_side_effects = previous;
+        }
         {
             let mut w = self.pty_writer.lock().unwrap();
             *w = real_writer;
@@ -337,6 +376,9 @@ impl Terminal {
     /// Resize terminal and (if local) PTY.
     pub fn resize(&mut self, bounds: TerminalBounds) -> Result<()> {
         self.last_content.terminal_bounds = bounds;
+        if let Ok(mut state) = self.effect_state.lock() {
+            state.set_size(bounds);
+        }
         self.ghostty
             .resize(
                 bounds.cols,
@@ -372,8 +414,17 @@ impl Terminal {
         // so update them on every sync — even on Dirty::False — so that cursor
         // moves that don't dirty cells (rare) still propagate.
         let cursor_vp = snapshot.cursor_viewport().ok().flatten();
+        let (cursor_col, cursor_wide_tail) = cursor_vp
+            .map(|c| {
+                if c.at_wide_tail && c.x > 0 {
+                    (c.x - 1, true)
+                } else {
+                    (c.x, false)
+                }
+            })
+            .unwrap_or((0, false));
         self.last_content.cursor = CursorInfo {
-            col: cursor_vp.map(|c| c.x).unwrap_or(0),
+            col: cursor_col,
             row: cursor_vp.map(|c| c.y).unwrap_or(0),
             visible: cursor_vp.is_some() && snapshot.cursor_visible().unwrap_or(true),
             blinking: snapshot.cursor_blinking().unwrap_or(true),
@@ -390,10 +441,16 @@ impl Terminal {
             self.last_content.bg_color = colors.background;
         }
 
+        if let Ok(state) = self.effect_state.lock() {
+            self.breadcrumb_text = state.title.clone();
+            self.last_content.bell_count = state.bell_count;
+        }
+
         // sync() always resets scrollbar to None — caller (e.g. tick()) is
         // responsible for fetching it via update_scrollbar() when needed.
         // Reset early so the Dirty::Clean fast-path stays consistent.
         self.last_content.scrollbar = None;
+        self.last_content.dirty_rows.clear();
 
         let dirty_state = snapshot.dirty().unwrap_or(Dirty::Full);
         let rows_count = snapshot.rows().unwrap_or(0) as usize;
@@ -412,6 +469,20 @@ impl Terminal {
             // so the next render_state.update() returns a fresh dirty signal
             // instead of a stale snapshot.
             let _ = snapshot.set_dirty(Dirty::Clean);
+            if self.last_content.cursor.visible {
+                let cursor_row = self.last_content.cursor.row as usize;
+                let cursor_col = self.last_content.cursor.col;
+                let scanned_wide_cell = self
+                    .last_content
+                    .cells
+                    .get(cursor_row)
+                    .map(|row| {
+                        row.iter()
+                            .any(|c| c.col == cursor_col && c.wide == CellWidthKind::Wide)
+                    })
+                    .unwrap_or(false);
+                self.last_content.cursor.is_wide = cursor_wide_tail || scanned_wide_cell;
+            }
             return;
         }
 
@@ -424,6 +495,7 @@ impl Terminal {
 
         let fg_default = self.last_content.fg_color;
         let bg_default = self.last_content.bg_color;
+        let mut touched_rows = false;
 
         if let Ok(mut row_iter) = self.row_iterator.update(&snapshot) {
             let mut row_idx: usize = 0;
@@ -446,6 +518,8 @@ impl Terminal {
                     continue;
                 }
 
+                self.last_content.dirty_rows.push(row_idx as u16);
+                touched_rows = true;
                 let row_cells = &mut cells[row_idx];
                 row_cells.clear();
 
@@ -530,13 +604,19 @@ impl Terminal {
         if self.last_content.cursor.visible {
             let cursor_row = self.last_content.cursor.row as usize;
             let cursor_col = self.last_content.cursor.col;
-            self.last_content.cursor.is_wide = cells
+            let scanned_wide_cell = cells
                 .get(cursor_row)
                 .map(|row| {
                     row.iter()
                         .any(|c| c.col == cursor_col && c.wide == CellWidthKind::Wide)
                 })
                 .unwrap_or(false);
+            self.last_content.cursor.is_wide = cursor_wide_tail || scanned_wide_cell;
+        }
+
+        if touched_rows || geometry_changed {
+            self.last_content.content_generation =
+                self.last_content.content_generation.saturating_add(1);
         }
 
         self.last_content.cells = cells;
@@ -601,14 +681,34 @@ impl Terminal {
         self.mouse_encoder.set_size(size);
     }
 
+    /// Track whether any mouse button is currently pressed.
+    pub fn set_mouse_any_button_pressed(&mut self, pressed: bool) {
+        self.mouse_encoder.set_any_button_pressed(pressed);
+    }
+
+    /// Enable or disable mouse motion deduplication by last cell.
+    pub fn set_mouse_track_last_cell(&mut self, enabled: bool) {
+        self.mouse_encoder.set_track_last_cell(enabled);
+    }
+
     /// Send focus in event.
     pub fn focus_in(&mut self) {
-        // TODO: encode focus event via libghostty focus API when available
+        if self.ghostty.mode(Mode::FOCUS_EVENT).unwrap_or(false) {
+            let mut buf = [0u8; 8];
+            if let Ok(written) = focus::Event::Gained.encode(&mut buf) {
+                self.input_raw(&buf[..written]);
+            }
+        }
     }
 
     /// Send focus out event.
     pub fn focus_out(&mut self) {
-        // TODO: encode focus event via libghostty focus API when available
+        if self.ghostty.mode(Mode::FOCUS_EVENT).unwrap_or(false) {
+            let mut buf = [0u8; 8];
+            if let Ok(written) = focus::Event::Lost.encode(&mut buf) {
+                self.input_raw(&buf[..written]);
+            }
+        }
     }
 
     pub fn breadcrumb_text(&self) -> &str {
@@ -715,7 +815,8 @@ impl TerminalBuilder {
 
         let pty_writer: SharedWriter = Arc::new(Mutex::new(writer));
 
-        let (ghostty, helpers) = Self::setup_ghostty(&self.config, pty_writer.clone())?;
+        let (ghostty, helpers, effect_state) =
+            Self::setup_ghostty(&self.config, pty_writer.clone())?;
 
         let terminal = Terminal {
             ghostty,
@@ -726,6 +827,7 @@ impl TerminalBuilder {
             mouse_encoder: helpers.mouse_encoder,
             key_event: helpers.key_event,
             mouse_event: helpers.mouse_event,
+            effect_state,
             pty_writer,
             resizer: Box::new(PtyResizer {
                 master: pair.master,
@@ -746,7 +848,8 @@ impl TerminalBuilder {
     /// The caller is responsible for feeding PTY output into `terminal.feed_pty_data()`.
     pub fn build_attached(self, daemon_writer: Box<dyn Write + Send>) -> Result<Terminal> {
         let pty_writer: SharedWriter = Arc::new(Mutex::new(daemon_writer));
-        let (ghostty, helpers) = Self::setup_ghostty(&self.config, pty_writer.clone())?;
+        let (ghostty, helpers, effect_state) =
+            Self::setup_ghostty(&self.config, pty_writer.clone())?;
 
         let terminal = Terminal {
             ghostty,
@@ -757,6 +860,7 @@ impl TerminalBuilder {
             mouse_encoder: helpers.mouse_encoder,
             key_event: helpers.key_event,
             mouse_event: helpers.mouse_event,
+            effect_state,
             pty_writer,
             resizer: Box::new(DaemonResizer),
             _child: None,
@@ -773,7 +877,11 @@ impl TerminalBuilder {
     fn setup_ghostty(
         config: &TerminalConfig,
         pty_writer: SharedWriter,
-    ) -> Result<(Box<GhosttyTerminal<'static, 'static>>, GhosttyHelpers)> {
+    ) -> Result<(
+        Box<GhosttyTerminal<'static, 'static>>,
+        GhosttyHelpers,
+        Arc<Mutex<effects::TerminalEffectState>>,
+    )> {
         let mut ghostty = Box::new(
             GhosttyTerminal::new(TerminalOptions {
                 cols: config.cols,
@@ -789,6 +897,13 @@ impl TerminalBuilder {
         let _ = ghostty.set_default_bg_color(Some(config.theme.background.to_ghostty()));
         let _ = ghostty.set_default_cursor_color(Some(config.theme.cursor.to_ghostty()));
 
+        let effect_state = Arc::new(Mutex::new(effects::TerminalEffectState::new(
+            config.cols,
+            config.rows,
+            8.0,
+            16.0,
+        )));
+
         let pty_writer_cb = pty_writer.clone();
         ghostty
             .on_pty_write(move |_terminal, data| {
@@ -798,6 +913,47 @@ impl TerminalBuilder {
                 }
             })
             .map_err(|e| anyhow::anyhow!("Failed to set pty_write callback: {e}"))?;
+
+        let state_for_bell = effect_state.clone();
+        ghostty
+            .on_bell(move |_terminal| {
+                if let Ok(mut state) = state_for_bell.lock()
+                    && !state.suppress_side_effects
+                {
+                    state.bell_count = state.bell_count.saturating_add(1);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to set bell callback: {e}"))?;
+
+        let state_for_title = effect_state.clone();
+        ghostty
+            .on_title_changed(move |terminal| {
+                if let Ok(mut state) = state_for_title.lock()
+                    && !state.suppress_side_effects
+                    && let Ok(title) = terminal.title()
+                {
+                    state.title.clear();
+                    state.title.push_str(title);
+                }
+            })
+            .map_err(|e| anyhow::anyhow!("Failed to set title callback: {e}"))?;
+
+        let state_for_size = effect_state.clone();
+        ghostty
+            .on_size(move |_terminal| state_for_size.lock().ok().map(|state| state.size))
+            .map_err(|e| anyhow::anyhow!("Failed to set size callback: {e}"))?;
+        ghostty
+            .on_enquiry(|_terminal| Some(effects::ENQUIRY_RESPONSE))
+            .map_err(|e| anyhow::anyhow!("Failed to set enquiry callback: {e}"))?;
+        ghostty
+            .on_xtversion(|_terminal| Some(effects::XTVERSION_RESPONSE))
+            .map_err(|e| anyhow::anyhow!("Failed to set xtversion callback: {e}"))?;
+        ghostty
+            .on_color_scheme(|_terminal| Some(effects::color_scheme()))
+            .map_err(|e| anyhow::anyhow!("Failed to set color scheme callback: {e}"))?;
+        ghostty
+            .on_device_attributes(|_terminal| Some(effects::device_attributes()))
+            .map_err(|e| anyhow::anyhow!("Failed to set device attributes callback: {e}"))?;
 
         let render_state = RenderState::new()
             .map_err(|e| anyhow::anyhow!("Failed to create render state: {e}"))?;
@@ -825,6 +981,7 @@ impl TerminalBuilder {
                 key_event,
                 mouse_event,
             },
+            effect_state,
         ))
     }
 }
