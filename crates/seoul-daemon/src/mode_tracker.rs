@@ -7,7 +7,7 @@
 
 const MAX_ESC_BUFFER_SIZE: usize = 1024;
 
-/// The 14 terminal modes we track for rehydration.
+/// The 20 terminal modes we track for rehydration.
 #[derive(Debug, Clone)]
 pub struct TerminalModes {
     pub application_cursor_keys: bool, // DECSET 1
