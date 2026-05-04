@@ -42,6 +42,7 @@ pub struct TerminalView {
     terminal: Terminal,
     data_rx: async_channel::Receiver<Vec<u8>>,
     focus_handle: FocusHandle,
+    _focus_subscriptions: [Subscription; 2],
     config: TerminalConfig,
     cell_width: f32,
     cell_height: f32,
@@ -69,7 +70,8 @@ pub struct TerminalView {
     // IME
     ime_preedit: String,
     // Element bounds for resize (shared with paint callback via Rc, no Entity access)
-    element_bounds: Rc<Cell<Option<Size<Pixels>>>>,
+    element_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
+    mouse_button_pressed: bool,
     // Daemon session info (None for local PTY mode)
     session_id: Option<seoul_terminal_proto::session::SessionId>,
     daemon_client_writer: Option<DaemonClientWriter>,
@@ -288,11 +290,26 @@ impl TerminalView {
         let (cell_width, cell_height) = Self::measure_cells(window, &config);
 
         let focus_handle = cx.focus_handle();
+        let _focus_subscriptions = [
+            cx.on_focus_in(&focus_handle, window, |this, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_in();
+                }
+                cx.notify();
+            }),
+            cx.on_focus_out(&focus_handle, window, |this, _event, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_out();
+                }
+                cx.notify();
+            }),
+        ];
 
         let mut this = Self {
             terminal,
             data_rx,
             focus_handle,
+            _focus_subscriptions,
             last_cols: config.cols,
             last_rows: config.rows,
             cell_width,
@@ -306,6 +323,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
+            mouse_button_pressed: false,
             session_id: None,
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Local { cwd }),
@@ -338,6 +356,20 @@ impl TerminalView {
         let (cell_width, cell_height) = Self::measure_cells(window, &config);
 
         let focus_handle = cx.focus_handle();
+        let _focus_subscriptions = [
+            cx.on_focus_in(&focus_handle, window, |this, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_in();
+                }
+                cx.notify();
+            }),
+            cx.on_focus_out(&focus_handle, window, |this, _event, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_out();
+                }
+                cx.notify();
+            }),
+        ];
 
         // No bootstrap of the blink cycle here: pending mode shows a
         // "Restoring session..." overlay with no visible cursor. The
@@ -347,6 +379,7 @@ impl TerminalView {
             terminal,
             data_rx,
             focus_handle,
+            _focus_subscriptions,
             last_cols: config.cols,
             last_rows: config.rows,
             cell_width,
@@ -360,6 +393,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
+            mouse_button_pressed: false,
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: None,
@@ -420,6 +454,7 @@ impl TerminalView {
         // callback that the prior bootstrap may have armed.
         let _ = self.bump_resize_debounce_epoch();
         let _ = self.bump_resize_ack_timeout_epoch();
+        self.update_mouse_size_from_bounds();
         // Replaces any prior drain task — the old Task is dropped and cancels.
         self.spawn_data_drain(cx);
     }
@@ -514,6 +549,7 @@ impl TerminalView {
         // callback that the prior bootstrap may have armed.
         let _ = self.bump_resize_debounce_epoch();
         let _ = self.bump_resize_ack_timeout_epoch();
+        self.update_mouse_size_from_bounds();
         // Replaces any prior drain tasks — the old Tasks are dropped and cancel.
         self.spawn_data_drain(cx);
         self.spawn_resize_ack_drain(cx);
@@ -531,7 +567,7 @@ impl TerminalView {
             return false;
         };
 
-        let Some(viewport) = self.element_bounds.get() else {
+        let Some(viewport) = self.element_bounds.get().map(|b| b.size) else {
             self.bootstrap = Some(bootstrap);
             return false;
         };
@@ -670,11 +706,26 @@ impl TerminalView {
         let (cell_width, cell_height) = Self::measure_cells(window, &config);
 
         let focus_handle = cx.focus_handle();
+        let _focus_subscriptions = [
+            cx.on_focus_in(&focus_handle, window, |this, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_in();
+                }
+                cx.notify();
+            }),
+            cx.on_focus_out(&focus_handle, window, |this, _event, _window, cx| {
+                if this.is_interactive() {
+                    this.terminal.focus_out();
+                }
+                cx.notify();
+            }),
+        ];
 
         let mut this = Self {
             terminal,
             data_rx: data_placeholder,
             focus_handle,
+            _focus_subscriptions,
             last_cols: config.cols,
             last_rows: config.rows,
             cell_width,
@@ -688,6 +739,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
+            mouse_button_pressed: false,
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Attached {
@@ -805,9 +857,10 @@ impl TerminalView {
             return;
         }
         if !self.pending {
-            let Some(size) = self.element_bounds.get() else {
+            let Some(size) = self.element_bounds.get().map(|b| b.size) else {
                 return;
             };
+            self.update_mouse_size_from_bounds();
             if self.check_resize(size) {
                 self.schedule_resize_debounce_flush(cx);
             }
@@ -880,6 +933,7 @@ impl TerminalView {
         self.pending_bounds = None;
         let _ = self.bump_resize_ack_timeout_epoch();
         let _ = self.terminal.resize(bounds);
+        self.update_mouse_size_from_bounds();
     }
 
     fn check_resize(&mut self, viewport: Size<Pixels>) -> bool {
@@ -1003,7 +1057,26 @@ impl TerminalView {
             "resize ack timeout fired; applying local resize as fallback"
         );
         let _ = self.terminal.resize(bounds);
+        self.update_mouse_size_from_bounds();
         cx.notify();
+    }
+
+    fn update_mouse_size_from_bounds(&mut self) {
+        let Some(bounds) = self.element_bounds.get() else {
+            return;
+        };
+        let pad = self.config.padding.round().max(0.0) as u32;
+        self.terminal.set_mouse_size(mouse::EncoderSize {
+            screen_width: f32::from(bounds.size.width).round().max(1.0) as u32,
+            screen_height: f32::from(bounds.size.height).round().max(1.0) as u32,
+            cell_width: self.cell_width.round().max(1.0) as u32,
+            cell_height: self.cell_height.round().max(1.0) as u32,
+            padding_top: pad,
+            padding_bottom: pad,
+            padding_right: pad,
+            padding_left: pad,
+        });
+        self.terminal.set_mouse_track_last_cell(true);
     }
 
     /// Spawn the ResizeAck drain task.
@@ -1153,6 +1226,115 @@ impl TerminalView {
 
     fn copy(&mut self, _: &Copy, _window: &mut Window, _cx: &mut Context<Self>) {
         // TODO: implement text selection + copy
+    }
+
+    fn mouse_mods(modifiers: gpui::Modifiers) -> key::Mods {
+        let mut mods = key::Mods::empty();
+        if modifiers.shift {
+            mods |= key::Mods::SHIFT;
+        }
+        if modifiers.control {
+            mods |= key::Mods::CTRL;
+        }
+        if modifiers.alt {
+            mods |= key::Mods::ALT;
+        }
+        if modifiers.platform {
+            mods |= key::Mods::SUPER;
+        }
+        mods
+    }
+
+    fn ghostty_mouse_button(button: MouseButton) -> Option<mouse::Button> {
+        match button {
+            MouseButton::Left => Some(mouse::Button::Left),
+            MouseButton::Right => Some(mouse::Button::Right),
+            MouseButton::Middle => Some(mouse::Button::Middle),
+            _ => None,
+        }
+    }
+
+    fn on_terminal_mouse_down(
+        &mut self,
+        event: &MouseDownEvent,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        window.focus(&self.focus_handle, cx);
+        if !self.is_interactive() {
+            return;
+        }
+        let Some(button) = Self::ghostty_mouse_button(event.button) else {
+            return;
+        };
+        self.mouse_button_pressed = true;
+        self.terminal.set_mouse_any_button_pressed(true);
+        self.terminal.set_mouse_track_last_cell(true);
+        if self.terminal.is_mouse_tracking() {
+            self.terminal.send_mouse_event(
+                mouse::Action::Press,
+                Some(button),
+                Self::mouse_mods(event.modifiers),
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+            );
+            self.show_cursor_now(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_terminal_mouse_up(
+        &mut self,
+        event: &MouseUpEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_interactive() {
+            return;
+        }
+        let Some(button) = Self::ghostty_mouse_button(event.button) else {
+            return;
+        };
+        self.mouse_button_pressed = false;
+        self.terminal.set_mouse_any_button_pressed(false);
+        self.terminal.set_mouse_track_last_cell(true);
+        if self.terminal.is_mouse_tracking() {
+            self.terminal.send_mouse_event(
+                mouse::Action::Release,
+                Some(button),
+                Self::mouse_mods(event.modifiers),
+                f32::from(event.position.x),
+                f32::from(event.position.y),
+            );
+            self.show_cursor_now(cx);
+            cx.notify();
+        }
+    }
+
+    fn on_terminal_mouse_move(
+        &mut self,
+        event: &MouseMoveEvent,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.is_interactive() || !self.terminal.is_mouse_tracking() {
+            return;
+        }
+        self.terminal
+            .set_mouse_any_button_pressed(self.mouse_button_pressed);
+        self.terminal.set_mouse_track_last_cell(true);
+        let button = event.pressed_button.and_then(Self::ghostty_mouse_button);
+        self.terminal.send_mouse_event(
+            mouse::Action::Motion,
+            button,
+            Self::mouse_mods(event.modifiers),
+            f32::from(event.position.x),
+            f32::from(event.position.y),
+        );
+        if self.mouse_button_pressed {
+            self.show_cursor_now(cx);
+            cx.notify();
+        }
     }
 
     /// Map a GPUI keystroke to libghostty key + mods.
@@ -1432,8 +1614,8 @@ impl Render for TerminalView {
                 // When the size actually changes, defer-spawn an entity update on the
                 // view so on_bounds_changed runs after the paint phase completes;
                 // we can't re-enter the view from inside paint.
-                let prev = bounds_cell.replace(Some(bounds.size));
-                if prev != Some(bounds.size) {
+                let prev = bounds_cell.replace(Some(bounds));
+                if prev.map(|b| b.size) != Some(bounds.size) {
                     let weak = weak_view.clone();
                     cx.spawn(async move |cx| {
                         weak.update(cx, |this, cx| this.on_bounds_changed(cx)).ok();
@@ -1506,6 +1688,31 @@ impl Render for TerminalView {
             .line_height(px(ch))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
+            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
+            .on_mouse_down(
+                MouseButton::Right,
+                cx.listener(Self::on_terminal_mouse_down),
+            )
+            .on_mouse_down(
+                MouseButton::Middle,
+                cx.listener(Self::on_terminal_mouse_down),
+            )
+            .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_up(MouseButton::Right, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_up(
+                MouseButton::Middle,
+                cx.listener(Self::on_terminal_mouse_up),
+            )
+            .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_up_out(
+                MouseButton::Right,
+                cx.listener(Self::on_terminal_mouse_up),
+            )
+            .on_mouse_up_out(
+                MouseButton::Middle,
+                cx.listener(Self::on_terminal_mouse_up),
+            )
+            .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if !this.is_interactive() {
                     return;
