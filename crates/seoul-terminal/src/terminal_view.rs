@@ -11,9 +11,9 @@ use gpui::prelude::FluentBuilder as _;
 use gpui::*;
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{key, key as gkey, mouse};
-use seoul_terminal::config::TerminalConfig;
-use seoul_terminal::terminal::TerminalBounds;
-use seoul_terminal::{Terminal, TerminalBuilder};
+use seoul_vt::config::TerminalConfig;
+use seoul_vt::terminal::TerminalBounds;
+use seoul_vt::{Terminal, TerminalBuilder};
 use seoul_workspace::settings::SettingsStore;
 
 use crate::daemon_client::{DaemonClient, DaemonClientWriter, DaemonSessionHandle};

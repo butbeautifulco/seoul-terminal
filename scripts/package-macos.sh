@@ -28,7 +28,7 @@ else
     TARGET_DIR="$REPO_ROOT/target"
 fi
 
-APP_VERSION="$(cargo pkgid -p seoul-app)"
+APP_VERSION="$(cargo pkgid -p seoul-terminal)"
 APP_VERSION="${APP_VERSION##*#}"
 BUILD_NUMBER="${SEOUL_BUILD_NUMBER:-$(git rev-list --count HEAD)}"
 GIT_SHA="$(git rev-parse --short=7 HEAD)"
@@ -46,7 +46,7 @@ else
 fi
 
 echo "Building ${APP_NAME} ${APP_VERSION} (${BUILD_NUMBER}) for ${TARGET_TRIPLE}"
-cargo build --release --target "$TARGET_TRIPLE" --package seoul-app --package seoul-daemon
+cargo build --release --target "$TARGET_TRIPLE" --package seoul-terminal --package seoul-daemon
 
 BIN_DIR="$TARGET_DIR/$TARGET_TRIPLE/release"
 BUILD_DIR="$TARGET_DIR/$TARGET_TRIPLE/release/build"

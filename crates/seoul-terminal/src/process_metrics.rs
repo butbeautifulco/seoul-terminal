@@ -1,4 +1,4 @@
-//! Self-measurement of the seoul-app client process.
+//! Self-measurement of the seoul-terminal client process.
 //!
 //! Mirrors the macOS path used by `seoul-daemon::resource_monitor` so the
 //! client can report its own CPU + memory in the resource panel without

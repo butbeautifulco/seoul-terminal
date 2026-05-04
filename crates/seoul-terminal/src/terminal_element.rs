@@ -4,8 +4,8 @@ use std::rc::Rc;
 use gpui::*;
 use libghostty_vt::render::CursorVisualStyle;
 use libghostty_vt::style::RgbColor;
-use seoul_terminal::config::TerminalConfig;
-use seoul_terminal::terminal::{CellWidthKind, TerminalContent};
+use seoul_vt::config::TerminalConfig;
+use seoul_vt::terminal::{CellWidthKind, TerminalContent};
 
 /// A contiguous run of cells sharing the same style.
 ///

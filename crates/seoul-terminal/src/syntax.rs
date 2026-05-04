@@ -217,7 +217,7 @@ impl SyntaxHighlighter {
 // -- Language registry --
 //
 // To add a new language:
-// 1. Add the tree-sitter-* crate to workspace Cargo.toml and crates/seoul-app/Cargo.toml
+// 1. Add the tree-sitter-* crate to workspace Cargo.toml and crates/seoul-terminal/Cargo.toml
 // 2. Add a `register(...)` call in `build_registry()` below
 
 fn load_language(ext: &str) -> Option<(Language, &'static str)> {

@@ -1,9 +1,9 @@
 [workspace]
 resolver = "2"
 members = [
-    "crates/seoul-app",
-    "crates/seoul-daemon",
     "crates/seoul-terminal",
+    "crates/seoul-daemon",
+    "crates/seoul-vt",
     "crates/seoul-terminal-proto",
     "crates/seoul-workspace",
 ]

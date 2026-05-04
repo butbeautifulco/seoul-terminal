@@ -157,7 +157,7 @@ pub struct ResourceIndicator {
     /// Window-coordinate bounds of the badge, captured each frame so the popover
     /// panel can anchor itself directly above the trigger.
     badge_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    /// Latest CPU% + memory for the seoul-app (client) process itself,
+    /// Latest CPU% + memory for the seoul-terminal (client) process itself,
     /// computed locally each poll tick.
     self_metrics: Option<(f64, u64)>,
     /// Previous self-measurement for delta-based CPU% calculation.
@@ -197,7 +197,7 @@ impl ResourceIndicator {
                     .spawn(async move { writer.lock().ok().and_then(|r| r.request_snapshot()) })
                     .await;
 
-                // Locally measure the seoul-app process itself; the daemon
+                // Locally measure the seoul-terminal process itself; the daemon
                 // doesn't see us, so we report our own footprint.
                 let self_sample = process_metrics::measure_self();
 
@@ -531,7 +531,7 @@ impl ResourceIndicator {
                     ),
             );
 
-        // Process section — daemon and seoul-app (the GPUI client itself).
+        // Process section — daemon and seoul-terminal (the GPUI client itself).
         // Same row format so the two are visually directly comparable.
         let process_row = |label: &'static str, cpu: f64, mem: u64, t: &theme::ThemeColors| {
             div()
@@ -583,8 +583,8 @@ impl ResourceIndicator {
                     &t,
                 ))
                 .child(match self.self_metrics {
-                    Some((cpu, mem)) => process_row("seoul-app", cpu, mem, &t),
-                    None => process_row("seoul-app", 0.0, 0, &t),
+                    Some((cpu, mem)) => process_row("seoul-terminal", cpu, mem, &t),
+                    None => process_row("seoul-terminal", 0.0, 0, &t),
                 }),
         );
 

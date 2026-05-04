@@ -3,9 +3,9 @@ use std::sync::mpsc;
 use std::thread;
 use std::time::Duration;
 
-use seoul_terminal::TerminalBuilder;
-use seoul_terminal::config::TerminalConfig;
-use seoul_terminal::terminal::TerminalBounds;
+use seoul_vt::TerminalBuilder;
+use seoul_vt::config::TerminalConfig;
+use seoul_vt::terminal::TerminalBounds;
 
 #[test]
 fn test_pty_spawn_and_echo_roundtrip() {
@@ -135,7 +135,7 @@ fn test_feed_pty_data() {
 
 fn drain_channel(
     rx: &mpsc::Receiver<Vec<u8>>,
-    terminal: &mut seoul_terminal::Terminal,
+    terminal: &mut seoul_vt::Terminal,
     timeout: Duration,
 ) {
     let deadline = std::time::Instant::now() + timeout;

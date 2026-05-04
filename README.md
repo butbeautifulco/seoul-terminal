@@ -34,9 +34,9 @@ just lint   # cargo clippy --workspace -- -D warnings
 
 ```
 crates/
-  seoul-app              GPUI app binary (`seoul`); terminal + editor + workspace UI
+  seoul-terminal         GPUI app binary (`seoul`); terminal + editor + workspace UI
   seoul-daemon           tokio async daemon; owns PTYs and sessions; ~/.seoul/terminal-host.sock
-  seoul-terminal         VT rendering layer wrapping libghostty-vt
+  seoul-vt               VT rendering layer wrapping libghostty-vt
   seoul-terminal-proto   RPC message types (frames, sessions, resources) and socket paths
   seoul-workspace        project persistence, git integration, settings store
 ```

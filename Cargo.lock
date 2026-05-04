@@ -5170,7 +5170,29 @@ dependencies = [
 ]
 
 [[package]]
-name = "seoul-app"
+name = "seoul-daemon"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "dirs 6.0.0",
+ "libc",
+ "octocrab",
+ "portable-pty",
+ "rand 0.8.5",
+ "rmp-serde",
+ "seoul-terminal-proto",
+ "seoul-workspace",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
+name = "seoul-terminal"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -5185,8 +5207,8 @@ dependencies = [
  "portable-pty",
  "ropey",
  "rust-embed",
- "seoul-terminal",
  "seoul-terminal-proto",
+ "seoul-vt",
  "seoul-workspace",
  "serde_json",
  "smol",
@@ -5229,29 +5251,18 @@ dependencies = [
 ]
 
 [[package]]
-name = "seoul-daemon"
+name = "seoul-terminal-proto"
 version = "0.1.0"
 dependencies = [
  "anyhow",
- "async-trait",
  "dirs 6.0.0",
- "libc",
- "octocrab",
- "portable-pty",
- "rand 0.8.5",
  "rmp-serde",
- "seoul-terminal-proto",
- "seoul-workspace",
  "serde",
- "serde_json",
- "tokio",
- "tracing",
- "tracing-subscriber",
  "uuid",
 ]
 
 [[package]]
-name = "seoul-terminal"
+name = "seoul-vt"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -5263,17 +5274,6 @@ dependencies = [
  "smol",
  "tracing",
  "unicode-width",
-]
-
-[[package]]
-name = "seoul-terminal-proto"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "dirs 6.0.0",
- "rmp-serde",
- "serde",
- "uuid",
 ]
 
 [[package]]

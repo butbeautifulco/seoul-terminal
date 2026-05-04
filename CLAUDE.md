@@ -7,9 +7,9 @@ This file provides guidance to coding agents (Claude Code, Codex, etc.) when wor
 Seoul — a terminal/IDE hybrid built in Rust on GPUI (Zed's UI framework). A long-running `seoul-daemon` owns PTYs and sessions; the `seoul` app connects over a Unix socket using MessagePack RPC.
 
 Workspace crates:
-- `seoul-app` — GPUI application binary (`seoul`), terminal + editor + workspace UI
+- `seoul-terminal` — GPUI application binary (`seoul`), terminal + editor + workspace UI
 - `seoul-daemon` — tokio async daemon; PTY/session management; listens on `~/.seoul/terminal-host.sock`
-- `seoul-terminal` — VT rendering layer wrapping `libghostty-vt`
+- `seoul-vt` — VT rendering layer wrapping `libghostty-vt`
 - `seoul-terminal-proto` — RPC message definitions (frame, session, resources) and socket paths
 - `seoul-workspace` — project persistence, git integration, settings store
 
