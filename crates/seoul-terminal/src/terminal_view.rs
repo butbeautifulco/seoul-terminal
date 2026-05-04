@@ -71,7 +71,7 @@ pub struct TerminalView {
     ime_preedit: String,
     // Element bounds for resize (shared with paint callback via Rc, no Entity access)
     element_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    mouse_button_pressed: bool,
+    mouse_buttons_pressed: MouseButtonsPressed,
     // Daemon session info (None for local PTY mode)
     session_id: Option<seoul_terminal_proto::session::SessionId>,
     daemon_client_writer: Option<DaemonClientWriter>,
@@ -108,6 +108,28 @@ pub struct TerminalView {
     // spawned for daemon-attached sessions; local-PTY mode has no ACK
     // protocol. Drop = automatic cancel.
     resize_ack_drain_task: Option<gpui::Task<()>>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct MouseButtonsPressed {
+    left: bool,
+    right: bool,
+    middle: bool,
+}
+
+impl MouseButtonsPressed {
+    fn set(&mut self, button: MouseButton, pressed: bool) {
+        match button {
+            MouseButton::Left => self.left = pressed,
+            MouseButton::Right => self.right = pressed,
+            MouseButton::Middle => self.middle = pressed,
+            _ => {}
+        }
+    }
+
+    fn any(self) -> bool {
+        self.left || self.right || self.middle
+    }
 }
 
 impl TerminalView {
@@ -323,7 +345,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
-            mouse_button_pressed: false,
+            mouse_buttons_pressed: MouseButtonsPressed::default(),
             session_id: None,
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Local { cwd }),
@@ -393,7 +415,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
-            mouse_button_pressed: false,
+            mouse_buttons_pressed: MouseButtonsPressed::default(),
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: None,
@@ -739,7 +761,7 @@ impl TerminalView {
             scrollbar_fade_epoch: 0,
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
-            mouse_button_pressed: false,
+            mouse_buttons_pressed: MouseButtonsPressed::default(),
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Attached {
@@ -1257,14 +1279,12 @@ impl TerminalView {
     fn terminal_surface_position(
         position: gpui::Point<Pixels>,
         bounds: Option<Bounds<Pixels>>,
-    ) -> (f32, f32) {
-        let origin = bounds
-            .map(|bounds| bounds.origin)
-            .unwrap_or(point(Pixels::ZERO, Pixels::ZERO));
-        (
+    ) -> Option<(f32, f32)> {
+        let origin = bounds?.origin;
+        Some((
             f32::from(position.x - origin.x),
             f32::from(position.y - origin.y),
-        )
+        ))
     }
 
     fn on_terminal_mouse_down(
@@ -1280,12 +1300,16 @@ impl TerminalView {
         let Some(button) = Self::ghostty_mouse_button(event.button) else {
             return;
         };
-        self.mouse_button_pressed = true;
-        self.terminal.set_mouse_any_button_pressed(true);
+        self.mouse_buttons_pressed.set(event.button, true);
+        self.terminal
+            .set_mouse_any_button_pressed(self.mouse_buttons_pressed.any());
         self.terminal.set_mouse_track_last_cell(true);
         if self.terminal.is_mouse_tracking() {
-            let (pos_x, pos_y) =
-                Self::terminal_surface_position(event.position, self.element_bounds.get());
+            let Some((pos_x, pos_y)) =
+                Self::terminal_surface_position(event.position, self.element_bounds.get())
+            else {
+                return;
+            };
             self.terminal.send_mouse_event(
                 mouse::Action::Press,
                 Some(button),
@@ -1310,12 +1334,16 @@ impl TerminalView {
         let Some(button) = Self::ghostty_mouse_button(event.button) else {
             return;
         };
-        self.mouse_button_pressed = false;
-        self.terminal.set_mouse_any_button_pressed(false);
+        self.mouse_buttons_pressed.set(event.button, false);
+        let any_pressed = self.mouse_buttons_pressed.any();
+        self.terminal.set_mouse_any_button_pressed(any_pressed);
         self.terminal.set_mouse_track_last_cell(true);
         if self.terminal.is_mouse_tracking() {
-            let (pos_x, pos_y) =
-                Self::terminal_surface_position(event.position, self.element_bounds.get());
+            let Some((pos_x, pos_y)) =
+                Self::terminal_surface_position(event.position, self.element_bounds.get())
+            else {
+                return;
+            };
             self.terminal.send_mouse_event(
                 mouse::Action::Release,
                 Some(button),
@@ -1337,12 +1365,15 @@ impl TerminalView {
         if !self.is_interactive() || !self.terminal.is_mouse_tracking() {
             return;
         }
-        self.terminal
-            .set_mouse_any_button_pressed(self.mouse_button_pressed);
+        let any_pressed = self.mouse_buttons_pressed.any();
+        self.terminal.set_mouse_any_button_pressed(any_pressed);
         self.terminal.set_mouse_track_last_cell(true);
         let button = event.pressed_button.and_then(Self::ghostty_mouse_button);
-        let (pos_x, pos_y) =
-            Self::terminal_surface_position(event.position, self.element_bounds.get());
+        let Some((pos_x, pos_y)) =
+            Self::terminal_surface_position(event.position, self.element_bounds.get())
+        else {
+            return;
+        };
         self.terminal.send_mouse_event(
             mouse::Action::Motion,
             button,
@@ -1350,7 +1381,7 @@ impl TerminalView {
             pos_x,
             pos_y,
         );
-        if self.mouse_button_pressed {
+        if any_pressed {
             self.show_cursor_now(cx);
             cx.notify();
         }
@@ -1718,19 +1749,10 @@ impl Render for TerminalView {
             )
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
             .on_mouse_up(MouseButton::Right, cx.listener(Self::on_terminal_mouse_up))
-            .on_mouse_up(
-                MouseButton::Middle,
-                cx.listener(Self::on_terminal_mouse_up),
-            )
+            .on_mouse_up(MouseButton::Middle, cx.listener(Self::on_terminal_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_terminal_mouse_up))
-            .on_mouse_up_out(
-                MouseButton::Right,
-                cx.listener(Self::on_terminal_mouse_up),
-            )
-            .on_mouse_up_out(
-                MouseButton::Middle,
-                cx.listener(Self::on_terminal_mouse_up),
-            )
+            .on_mouse_up_out(MouseButton::Right, cx.listener(Self::on_terminal_mouse_up))
+            .on_mouse_up_out(MouseButton::Middle, cx.listener(Self::on_terminal_mouse_up))
             .on_mouse_move(cx.listener(Self::on_terminal_mouse_move))
             .on_key_down(cx.listener(|this, event: &KeyDownEvent, _window, cx| {
                 if !this.is_interactive() {
@@ -1762,8 +1784,11 @@ impl Render for TerminalView {
                     } else {
                         (mouse::Button::Five, -delta_lines) // scroll down
                     };
-                    let (pos_x, pos_y) =
-                        Self::terminal_surface_position(event.position, this.element_bounds.get());
+                    let Some((pos_x, pos_y)) =
+                        Self::terminal_surface_position(event.position, this.element_bounds.get())
+                    else {
+                        return;
+                    };
                     for _ in 0..count.min(5) {
                         this.terminal.send_mouse_event(
                             mouse::Action::Press,
