@@ -303,12 +303,22 @@ pub struct Terminal {
 
 impl Terminal {
     /// Try to handle a keystroke. Returns true if consumed.
-    pub fn try_keystroke(&mut self, key: key::Key, mods: key::Mods, utf8: Option<&str>) -> bool {
+    pub fn try_keystroke(
+        &mut self,
+        key: key::Key,
+        mods: key::Mods,
+        utf8: Option<&str>,
+        unshifted: Option<char>,
+    ) -> bool {
         self.key_event
             .set_action(key::Action::Press)
             .set_key(key)
             .set_mods(mods)
-            .set_consumed_mods(key::Mods::empty());
+            .set_consumed_mods(key::Mods::empty())
+            .set_composing(false);
+        if let Some(ch) = unshifted {
+            self.key_event.set_unshifted_codepoint(ch);
+        }
 
         if let Some(text) = utf8 {
             self.key_event.set_utf8(Some(text));

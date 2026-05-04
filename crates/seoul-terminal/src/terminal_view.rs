@@ -1392,7 +1392,9 @@ impl TerminalView {
     /// Only handles special keys and modifier combos (Ctrl+X, Alt+X).
     /// Regular printable characters (no Ctrl/Alt) are left to the IME
     /// InputHandler path (replace_text_in_range) to avoid double input.
-    fn map_keystroke(keystroke: &Keystroke) -> Option<(gkey::Key, gkey::Mods, Option<String>)> {
+    fn map_keystroke(
+        keystroke: &Keystroke,
+    ) -> Option<(gkey::Key, gkey::Mods, Option<String>, Option<char>)> {
         if keystroke.modifiers.platform {
             return None;
         }
@@ -1412,11 +1414,13 @@ impl TerminalView {
         }
 
         // Special keys — always handle in on_key_down
+        let mut unshifted = None;
         let key = match keystroke.key.as_str() {
             "enter" => gkey::Key::Enter,
             "backspace" => gkey::Key::Backspace,
             "tab" => gkey::Key::Tab,
             "escape" => gkey::Key::Escape,
+            "insert" => gkey::Key::Insert,
             "up" => gkey::Key::ArrowUp,
             "down" => gkey::Key::ArrowDown,
             "left" => gkey::Key::ArrowLeft,
@@ -1439,10 +1443,49 @@ impl TerminalView {
             "f10" => gkey::Key::F10,
             "f11" => gkey::Key::F11,
             "f12" => gkey::Key::F12,
+            "f13" => gkey::Key::F13,
+            "f14" => gkey::Key::F14,
+            "f15" => gkey::Key::F15,
+            "f16" => gkey::Key::F16,
+            "f17" => gkey::Key::F17,
+            "f18" => gkey::Key::F18,
+            "f19" => gkey::Key::F19,
+            "f20" => gkey::Key::F20,
+            "f21" => gkey::Key::F21,
+            "f22" => gkey::Key::F22,
+            "f23" => gkey::Key::F23,
+            "f24" => gkey::Key::F24,
+            "f25" => gkey::Key::F25,
+            "numpad0" => gkey::Key::Numpad0,
+            "numpad1" => gkey::Key::Numpad1,
+            "numpad2" => gkey::Key::Numpad2,
+            "numpad3" => gkey::Key::Numpad3,
+            "numpad4" => gkey::Key::Numpad4,
+            "numpad5" => gkey::Key::Numpad5,
+            "numpad6" => gkey::Key::Numpad6,
+            "numpad7" => gkey::Key::Numpad7,
+            "numpad8" => gkey::Key::Numpad8,
+            "numpad9" => gkey::Key::Numpad9,
+            "numpad_add" | "numpadadd" => gkey::Key::NumpadAdd,
+            "numpad_subtract" | "numpadsubtract" => gkey::Key::NumpadSubtract,
+            "numpad_multiply" | "numpadmultiply" => gkey::Key::NumpadMultiply,
+            "numpad_divide" | "numpaddivide" => gkey::Key::NumpadDivide,
+            "numpad_decimal" | "numpaddecimal" => gkey::Key::NumpadDecimal,
+            "numpad_enter" | "numpadenter" => gkey::Key::NumpadEnter,
+            "numpad_backspace" | "numpadbackspace" => gkey::Key::NumpadBackspace,
+            "numpad_up" | "numpadup" => gkey::Key::NumpadUp,
+            "numpad_down" | "numpaddown" => gkey::Key::NumpadDown,
+            "numpad_left" | "numpadleft" => gkey::Key::NumpadLeft,
+            "numpad_right" | "numpadright" => gkey::Key::NumpadRight,
             // Single-char keys: only handle with Ctrl or Alt modifier.
             // Without modifiers, let the IME InputHandler send the character.
-            s if s.len() == 1 && (has_ctrl || has_alt) => {
+            s if s.chars().count() == 1 && (has_ctrl || has_alt) => {
                 let ch = s.chars().next().unwrap();
+                unshifted = Some(if ch.is_ascii() {
+                    ch.to_ascii_lowercase()
+                } else {
+                    ch
+                });
                 match ch {
                     'a' | 'A' => gkey::Key::A,
                     'b' | 'B' => gkey::Key::B,
@@ -1498,7 +1541,7 @@ impl TerminalView {
         };
 
         let utf8 = keystroke.key_char.as_ref().map(|s| s.to_string());
-        Some((key, mods, utf8))
+        Some((key, mods, utf8, unshifted))
     }
 }
 
@@ -1515,6 +1558,55 @@ impl crate::item::Item for TerminalView {
 
     fn tab_kind_id(&self) -> &'static str {
         "terminal"
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::TerminalView;
+    use gpui::Keystroke;
+    use libghostty_vt::key as gkey;
+
+    fn keystroke(key: &str) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            ..Keystroke::default()
+        }
+    }
+
+    fn ctrl_keystroke(key: &str) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            modifiers: gpui::Modifiers {
+                control: true,
+                ..gpui::Modifiers::default()
+            },
+            ..Keystroke::default()
+        }
+    }
+
+    #[test]
+    fn maps_additional_fixed_keys() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&keystroke("insert")),
+            Some((gkey::Key::Insert, _, _, None))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&keystroke("f13")),
+            Some((gkey::Key::F13, _, _, None))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&keystroke("numpad_add")),
+            Some((gkey::Key::NumpadAdd, _, _, None))
+        ));
+    }
+
+    #[test]
+    fn maps_unshifted_for_single_character_keys() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&ctrl_keystroke("A")),
+            Some((gkey::Key::A, _, _, Some('a')))
+        ));
     }
 }
 
@@ -1758,14 +1850,17 @@ impl Render for TerminalView {
                 if !this.is_interactive() {
                     return;
                 }
-                if let Some((key, mods, utf8)) = Self::map_keystroke(&event.keystroke) {
+                if let Some((key, mods, utf8, unshifted)) =
+                    Self::map_keystroke(&event.keystroke)
+                {
                     this.show_cursor_now(cx);
                     // Commit pending IME preedit
                     if !this.ime_preedit.is_empty() {
                         let text = std::mem::take(&mut this.ime_preedit);
                         this.terminal.input(text.as_bytes());
                     }
-                    this.terminal.try_keystroke(key, mods, utf8.as_deref());
+                    this.terminal
+                        .try_keystroke(key, mods, utf8.as_deref(), unshifted);
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
