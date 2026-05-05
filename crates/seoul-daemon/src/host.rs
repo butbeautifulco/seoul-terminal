@@ -24,6 +24,23 @@ pub enum AttachResult {
     },
 }
 
+/// Inputs to `spawn_inner`, the shared body of `spawn_and_attach` /
+/// `spawn_unattached`. Two distinct messages (`CreateOrAttachMsg` /
+/// `EnsureSessionMsg`) are funnelled through one struct so the spawn
+/// path doesn't carry attach- or ensure-specific fields.
+struct SpawnParams {
+    session_id: SessionId,
+    workspace_id: Uuid,
+    cols: u16,
+    rows: u16,
+    cwd: Option<std::path::PathBuf>,
+    shell: Option<String>,
+    /// When true, the session is being recreated for cold-restore — the
+    /// readiness tracker should not drop terminal-query responses as
+    /// stale because the client just generated fresh ones.
+    was_recovered: bool,
+}
+
 /// Result of the fast phase of ensure_session.
 pub enum EnsureResult {
     /// Session is alive and ready to attach later.
@@ -108,28 +125,21 @@ impl TerminalHost {
         scrollback_data: Vec<u8>,
         was_recovered: bool,
     ) -> Result<SessionAttachedMsg> {
-        let mut session = DaemonSession::spawn(
-            msg.session_id,
-            msg.workspace_id,
-            msg.cols,
-            msg.rows,
-            msg.cwd,
-            msg.shell,
-        )?;
+        let scrollback_limit = msg.scrollback_limit_bytes;
+        let session = self.spawn_inner(SpawnParams {
+            session_id: msg.session_id,
+            workspace_id: msg.workspace_id,
+            cols: msg.cols,
+            rows: msg.rows,
+            cwd: msg.cwd,
+            shell: msg.shell,
+            was_recovered,
+        })?;
 
-        // Cold restore: the client's ghostty will generate fresh terminal query
-        // responses (DA1, DSR) for the new shell — don't drop them as stale.
-        if was_recovered {
-            session.disable_stale_response_filter();
-        }
-
-        let mut attached_msg = session.attach(client, msg.scrollback_limit_bytes);
+        let mut attached_msg = session.attach(client, scrollback_limit);
         attached_msg.is_new = true;
         attached_msg.was_recovered = was_recovered;
         attached_msg.scrollback_data = scrollback_data;
-
-        self.sessions.insert(msg.session_id, session);
-        self.resource_monitor.invalidate_cache();
         Ok(attached_msg)
     }
 
@@ -139,16 +149,17 @@ impl TerminalHost {
         msg: EnsureSessionMsg,
         was_recovered: bool,
     ) -> Result<SessionEnsuredMsg> {
-        let session = DaemonSession::spawn(
-            msg.session_id,
-            msg.workspace_id,
-            msg.cols,
-            msg.rows,
-            msg.cwd,
-            msg.shell,
-        )?;
+        let session = self.spawn_inner(SpawnParams {
+            session_id: msg.session_id,
+            workspace_id: msg.workspace_id,
+            cols: msg.cols,
+            rows: msg.rows,
+            cwd: msg.cwd,
+            shell: msg.shell,
+            was_recovered,
+        })?;
 
-        let ensured = SessionEnsuredMsg {
+        Ok(SessionEnsuredMsg {
             session_id: session.id,
             is_new: true,
             was_recovered,
@@ -156,11 +167,42 @@ impl TerminalHost {
             rows: session.meta.rows,
             cwd: Some(session.meta.cwd.to_string_lossy().into_owned()),
             foreground_process: session.meta.foreground_process.clone(),
-        };
+        })
+    }
 
-        self.sessions.insert(msg.session_id, session);
+    /// Shared spawn logic for `spawn_and_attach` / `spawn_unattached`.
+    ///
+    /// Builds the PTY-backed session, applies the cold-restore filter
+    /// switch, inserts it into the sessions map, and invalidates the
+    /// resource cache. Returns a `&mut` to the freshly inserted session
+    /// so the caller can perform variant-specific post-processing
+    /// (attaching a client, formatting an `Ensured` reply, etc.) without
+    /// a second map lookup.
+    fn spawn_inner(&mut self, params: SpawnParams) -> Result<&mut DaemonSession> {
+        let session_id = params.session_id;
+        let mut session = DaemonSession::spawn(
+            session_id,
+            params.workspace_id,
+            params.cols,
+            params.rows,
+            params.cwd,
+            params.shell,
+        )?;
+
+        // Cold restore: the client's ghostty will generate fresh terminal
+        // query responses (DA1, DSR) for the new shell — don't drop them
+        // as stale.
+        if params.was_recovered {
+            session.disable_stale_response_filter();
+        }
+
+        self.sessions.insert(session_id, session);
         self.resource_monitor.invalidate_cache();
-        Ok(ensured)
+        // Just inserted — the lookup cannot fail.
+        Ok(self
+            .sessions
+            .get_mut(&session_id)
+            .expect("session inserted moments ago must be present"))
     }
 
     /// Get a reference to a session by ID.
