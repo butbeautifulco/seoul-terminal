@@ -182,7 +182,7 @@ impl Render for TitleBar {
 /// Truncate long branch names with an ellipsis so they don't push the daemon
 /// indicator off-screen on narrow windows or unusually long feature branches.
 fn truncate_branch(branch: SharedString) -> SharedString {
-    if branch.chars().count() <= MAX_BRANCH_NAME_LENGTH {
+    if branch.chars().nth(MAX_BRANCH_NAME_LENGTH).is_none() {
         return branch;
     }
     let mut truncated: String = branch.chars().take(MAX_BRANCH_NAME_LENGTH - 1).collect();

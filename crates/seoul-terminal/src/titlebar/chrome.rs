@@ -22,7 +22,7 @@ impl WindowChrome {
         }
     }
 
-    pub fn set_children(&mut self, children: impl IntoIterator<Item = AnyElement>) {
+    pub(super) fn set_children(&mut self, children: impl IntoIterator<Item = AnyElement>) {
         self.children = children.into_iter().collect();
     }
 }

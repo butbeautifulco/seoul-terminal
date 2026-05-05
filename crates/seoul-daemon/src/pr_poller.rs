@@ -22,6 +22,7 @@ use uuid::Uuid;
 
 use seoul_terminal_proto::messages::{PrStatusUnavailableMsg, PrStatusUpdatedMsg};
 use seoul_terminal_proto::pr::{PrInfo, PrUnavailableReason};
+use seoul_workspace::git::branch;
 use seoul_workspace::git::hosting::{HostingProvider, HostingRegistry, ParsedRemote};
 use seoul_workspace::git::runner::GitCommandRunner;
 
@@ -270,13 +271,14 @@ async fn poll_one(
     let Some(remote) = ws.parsed_remote.clone() else {
         return;
     };
-    let working_dir = ws.working_dir.clone();
     let registered_branch = ws.branch.clone();
+    let working_dir = ws.working_dir.clone();
 
-    let working_dir_for_blocking = working_dir.clone();
     let git_read_res = task::spawn_blocking(move || {
-        let head_sha = read_head_sha(&working_dir_for_blocking)?;
-        let current_branch = read_current_branch(&working_dir_for_blocking);
+        let head_sha = read_head_sha(&working_dir)?;
+        let current_branch = branch::current_branch(&GitCommandRunner::new(&working_dir))
+            .ok()
+            .flatten();
         anyhow::Ok((head_sha, current_branch))
     })
     .await;
@@ -295,8 +297,12 @@ async fn poll_one(
     // On the default branch there's no PR to resolve — skip the GraphQL call
     // entirely and clear any stale PR card the UI may still be showing.
     if current_branch.as_deref() == Some(ws.default_branch.as_str()) {
-        ws.last_unavailable_kind = None;
-        ws.backoff_until = None;
+        if ws.last_unavailable_kind.is_some() {
+            ws.last_unavailable_kind = None;
+        }
+        if ws.backoff_until.is_some() {
+            ws.backoff_until = None;
+        }
         if ws.last_pr.is_some() {
             ws.last_pr = None;
             let _ = broadcast_tx.send(ClientEvent::PrStatusUpdated(PrStatusUpdatedMsg {
@@ -367,15 +373,4 @@ fn read_origin_url(working_dir: &Path) -> anyhow::Result<String> {
 
 fn read_head_sha(working_dir: &Path) -> anyhow::Result<String> {
     GitCommandRunner::new(working_dir).run(&["rev-parse", "HEAD"])
-}
-
-/// Resolve the local checkout's branch name. Returns `None` for detached
-/// HEAD (or any other failure); callers should fall back to the
-/// registration-time branch in that case.
-fn read_current_branch(working_dir: &Path) -> Option<String> {
-    GitCommandRunner::new(working_dir)
-        .run(&["symbolic-ref", "--short", "HEAD"])
-        .ok()
-        .map(|s| s.trim().to_string())
-        .filter(|s| !s.is_empty())
 }
