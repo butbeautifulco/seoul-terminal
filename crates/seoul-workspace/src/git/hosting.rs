@@ -94,6 +94,8 @@ pub fn parse_remote_url(url: &str) -> Option<ParsedRemote> {
         // git@host:owner/repo
         let (host, path) = rest.split_once(':')?;
         let (owner, repo) = path.split_once('/')?;
+        // Trim sub-paths (e.g. ".../repo/wiki") — GitHub repos aren't nested.
+        let repo = repo.split('/').next().unwrap_or(repo);
         if owner.is_empty() || repo.is_empty() {
             return None;
         }
@@ -114,6 +116,8 @@ pub fn parse_remote_url(url: &str) -> Option<ParsedRemote> {
         let host = parts.next()?;
         let owner = parts.next()?;
         let repo = parts.next()?;
+        // Trim sub-paths (e.g. ".../repo/wiki") — GitHub repos aren't nested.
+        let repo = repo.split('/').next().unwrap_or(repo);
         if host.is_empty() || owner.is_empty() || repo.is_empty() {
             return None;
         }
@@ -163,5 +167,19 @@ mod tests {
     fn parse_invalid() {
         assert!(parse_remote_url("not-a-url").is_none());
         assert!(parse_remote_url("https://github.com/owner").is_none());
+    }
+
+    #[test]
+    fn parse_https_strips_subpath() {
+        let r = parse_remote_url("https://github.com/owner/repo/wiki").unwrap();
+        assert_eq!(r.host, "github.com");
+        assert_eq!(r.owner, "owner");
+        assert_eq!(r.repo, "repo");
+    }
+
+    #[test]
+    fn parse_ssh_strips_subpath() {
+        let r = parse_remote_url("git@github.com:owner/repo/wiki").unwrap();
+        assert_eq!(r.repo, "repo");
     }
 }

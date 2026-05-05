@@ -97,6 +97,21 @@ impl HostingProvider for GitHubProvider {
         branch: &str,
         head_sha: &str,
     ) -> Result<Option<PrInfo>, ProviderError> {
+        // Reject inputs that would build a malformed Search query before we
+        // burn an HTTP round-trip on a guaranteed `query attribute` error.
+        if remote.owner.is_empty()
+            || remote.repo.is_empty()
+            || remote.repo.contains('/')
+            || head_sha.is_empty()
+        {
+            return Err(ProviderError::Other(format!(
+                "invalid remote/head for pr lookup: owner={:?} repo={:?} head_sha_len={}",
+                remote.owner,
+                remote.repo,
+                head_sha.len()
+            )));
+        }
+
         let search_query = format!("repo:{}/{} is:pr {}", remote.owner, remote.repo, head_sha);
         let body = json!({
             "query": GITHUB_PR_LOOKUP_QUERY,
@@ -114,6 +129,14 @@ impl HostingProvider for GitHubProvider {
         if let Some(errors) = resp.errors
             && !errors.is_empty()
         {
+            tracing::warn!(
+                owner = %remote.owner,
+                repo = %remote.repo,
+                branch = %branch,
+                head_sha = %head_sha,
+                search_query = %search_query,
+                "github pr lookup graphql errors: {errors:?}"
+            );
             return Err(ProviderError::Other(format!(
                 "graphql errors: {}",
                 serde_json::to_string(&errors).unwrap_or_default()
