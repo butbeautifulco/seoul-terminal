@@ -52,6 +52,35 @@ pub enum EditorEvent {
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
+// -- Cursor blink epoch helper --
+
+/// Monotonic epoch counter for cursor-blink timer callbacks.
+///
+/// Each `bump()` invalidates any in-flight timer scheduled with the
+/// previous epoch — when its callback finally fires, `should_tick`
+/// returns `false` and the callback no-ops. This is the same pattern
+/// used by `terminal_view.rs` (see `bump_blink_epoch`/`tick_blink`).
+//
+// Allowed-dead in WT1.1 because the legacy `tick` loop hasn't been
+// replaced yet; WT1.2 wires it into `show_cursor_now`/`tick_blink`.
+#[derive(Default)]
+#[allow(dead_code)]
+struct BlinkState {
+    epoch: u64,
+}
+
+#[allow(dead_code)]
+impl BlinkState {
+    fn bump(&mut self) -> u64 {
+        self.epoch += 1;
+        self.epoch
+    }
+
+    fn should_tick(&self, scheduled_epoch: u64) -> bool {
+        scheduled_epoch == self.epoch
+    }
+}
+
 // -- EditorView --
 
 pub struct EditorView {
@@ -83,6 +112,10 @@ pub struct EditorView {
     last_edit_epoch: std::time::Instant,
     last_blink_toggle: std::time::Instant,
     blink_loop_started: bool,
+    // Used by show_cursor_now / tick_blink in WT1.2; the legacy `tick`
+    // bootstrap still drives blinking until that swap lands.
+    #[allow(dead_code)]
+    blink: BlinkState,
 }
 
 impl EditorView {
@@ -131,6 +164,7 @@ impl EditorView {
             last_edit_epoch: std::time::Instant::now(),
             last_blink_toggle: std::time::Instant::now(),
             blink_loop_started: false,
+            blink: BlinkState::default(),
         }
     }
 
@@ -1139,5 +1173,26 @@ impl Render for EditorView {
             .on_key_down(cx.listener(Self::on_key_down))
             // Canvas
             .child(editor_canvas)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[::core::prelude::v1::test]
+    fn blink_epoch_monotonic_bump() {
+        let mut e = BlinkState::default();
+        let a = e.bump();
+        let b = e.bump();
+        assert!(b > a);
+    }
+
+    #[::core::prelude::v1::test]
+    fn blink_state_stale_callback_is_noop() {
+        let mut e = BlinkState::default();
+        let stale = e.bump();
+        let _fresh = e.bump();
+        assert!(!e.should_tick(stale));
     }
 }
