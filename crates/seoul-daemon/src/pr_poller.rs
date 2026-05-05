@@ -10,7 +10,7 @@
 //! poller can react immediately to UI events without waiting for the next tick.
 
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -38,6 +38,7 @@ pub enum PollerCmd {
         workspace_id: Uuid,
         working_dir: PathBuf,
         branch: String,
+        default_branch: String,
     },
     Unregister(Uuid),
     Focus(Option<Uuid>),
@@ -50,11 +51,18 @@ pub struct PollerHandle {
 }
 
 impl PollerHandle {
-    pub fn register(&self, workspace_id: Uuid, working_dir: PathBuf, branch: String) {
+    pub fn register(
+        &self,
+        workspace_id: Uuid,
+        working_dir: PathBuf,
+        branch: String,
+        default_branch: String,
+    ) {
         let _ = self.tx.try_send(PollerCmd::Register {
             workspace_id,
             working_dir,
             branch,
+            default_branch,
         });
     }
     pub fn unregister(&self, workspace_id: Uuid) {
@@ -70,7 +78,12 @@ impl PollerHandle {
 
 struct WorkspaceState {
     working_dir: PathBuf,
+    /// Branch as reported by the client at registration. Used as a fallback
+    /// for detached HEAD; otherwise the poller re-reads the current branch
+    /// from disk every poll so that local `git checkout` is reflected without
+    /// re-registration.
     branch: String,
+    default_branch: String,
     parsed_remote: Option<ParsedRemote>,
     provider: Option<Arc<dyn HostingProvider>>,
     last_pr: Option<PrInfo>,
@@ -92,10 +105,11 @@ enum UnavailableKind {
 }
 
 impl WorkspaceState {
-    fn new(working_dir: PathBuf, branch: String) -> Self {
+    fn new(working_dir: PathBuf, branch: String, default_branch: String) -> Self {
         Self {
             working_dir,
             branch,
+            default_branch,
             parsed_remote: None,
             provider: None,
             last_pr: None,
@@ -148,8 +162,9 @@ async fn handle_cmd(
             workspace_id,
             working_dir,
             branch,
+            default_branch,
         } => {
-            let mut ws = WorkspaceState::new(working_dir.clone(), branch);
+            let mut ws = WorkspaceState::new(working_dir.clone(), branch, default_branch);
             // Resolve origin → provider on registration; cheap blocking call.
             let working_dir_clone = working_dir.clone();
             let origin = task::spawn_blocking(move || read_origin_url(&working_dir_clone))
@@ -256,13 +271,19 @@ async fn poll_one(
         return;
     };
     let working_dir = ws.working_dir.clone();
-    let branch = ws.branch.clone();
+    let registered_branch = ws.branch.clone();
 
-    let head_sha_res = task::spawn_blocking(move || read_head_sha(&working_dir)).await;
-    let head_sha = match head_sha_res {
-        Ok(Ok(sha)) => sha,
+    let working_dir_for_blocking = working_dir.clone();
+    let git_read_res = task::spawn_blocking(move || {
+        let head_sha = read_head_sha(&working_dir_for_blocking)?;
+        let current_branch = read_current_branch(&working_dir_for_blocking);
+        anyhow::Ok((head_sha, current_branch))
+    })
+    .await;
+    let (head_sha, current_branch) = match git_read_res {
+        Ok(Ok(pair)) => pair,
         Ok(Err(e)) => {
-            warn!(?workspace_id, "failed to read HEAD sha: {e}");
+            warn!(?workspace_id, "failed to read HEAD: {e}");
             return;
         }
         Err(e) => {
@@ -270,6 +291,23 @@ async fn poll_one(
             return;
         }
     };
+
+    // On the default branch there's no PR to resolve — skip the GraphQL call
+    // entirely and clear any stale PR card the UI may still be showing.
+    if current_branch.as_deref() == Some(ws.default_branch.as_str()) {
+        ws.last_unavailable_kind = None;
+        ws.backoff_until = None;
+        if ws.last_pr.is_some() {
+            ws.last_pr = None;
+            let _ = broadcast_tx.send(ClientEvent::PrStatusUpdated(PrStatusUpdatedMsg {
+                workspace_id,
+                pr_info: None,
+            }));
+        }
+        return;
+    }
+
+    let branch = current_branch.unwrap_or(registered_branch);
 
     match provider
         .resolve_pr_for_branch(&remote, &branch, &head_sha)
@@ -323,10 +361,21 @@ fn send_unavailable(
     }));
 }
 
-fn read_origin_url(working_dir: &std::path::Path) -> anyhow::Result<String> {
+fn read_origin_url(working_dir: &Path) -> anyhow::Result<String> {
     GitCommandRunner::new(working_dir).run(&["remote", "get-url", "origin"])
 }
 
-fn read_head_sha(working_dir: &std::path::Path) -> anyhow::Result<String> {
+fn read_head_sha(working_dir: &Path) -> anyhow::Result<String> {
     GitCommandRunner::new(working_dir).run(&["rev-parse", "HEAD"])
+}
+
+/// Resolve the local checkout's branch name. Returns `None` for detached
+/// HEAD (or any other failure); callers should fall back to the
+/// registration-time branch in that case.
+fn read_current_branch(working_dir: &Path) -> Option<String> {
+    GitCommandRunner::new(working_dir)
+        .run(&["symbolic-ref", "--short", "HEAD"])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
 }

@@ -457,11 +457,14 @@ impl AppView {
         };
         for ws in &self.state.workspaces {
             let project = self.state.projects.iter().find(|p| p.id == ws.project_id);
-            let working_dir = match project {
-                Some(p) => ws.working_dir(p).to_path_buf(),
-                None => continue,
-            };
-            let _ = client.register_workspace(ws.id, working_dir, ws.branch.clone());
+            let Some(p) = project else { continue };
+            let working_dir = ws.working_dir(p).to_path_buf();
+            let _ = client.register_workspace(
+                ws.id,
+                working_dir,
+                ws.branch.clone(),
+                p.default_branch.clone(),
+            );
         }
     }
 
@@ -473,7 +476,12 @@ impl AppView {
             return;
         };
         let working_dir = ws.working_dir(project).to_path_buf();
-        let _ = client.register_workspace(ws.id, working_dir, ws.branch.clone());
+        let _ = client.register_workspace(
+            ws.id,
+            working_dir,
+            ws.branch.clone(),
+            project.default_branch.clone(),
+        );
     }
 
     fn unregister_workspace_with_daemon(&self, workspace_id: Uuid) {
@@ -2943,6 +2951,107 @@ impl AppView {
         body.child(buttons).into_any_element()
     }
 
+    /// Card shown in place of the PR card when the active workspace sits on
+    /// the project's default branch. There's no PR to display, so we surface
+    /// the local-vs-remote comparison instead (ahead/behind + line totals
+    /// against `origin/{default_branch}`). All data comes from the existing
+    /// `GitChangesStatus`; no new RPC traffic is required.
+    fn render_remote_compare_card(
+        &self,
+        default_branch: &str,
+        t: &theme::ThemeColors,
+        cx: &mut Context<Self>,
+    ) -> AnyElement {
+        let card = div()
+            .id("remote-compare-card")
+            .flex_none()
+            .flex()
+            .flex_col()
+            .gap(px(4.))
+            .px(px(8.))
+            .py(px(8.))
+            .border_b_1()
+            .border_color(rgb(t.surface0));
+
+        let Some(provider) = &self.git_provider else {
+            return card
+                .child(
+                    div()
+                        .text_size(px(11.))
+                        .text_color(rgb(t.overlay2))
+                        .child("No git status yet"),
+                )
+                .into_any_element();
+        };
+
+        let status = provider.read(cx).status();
+        let (additions, deletions) = status
+            .against_base
+            .iter()
+            .fold((0u32, 0u32), |(a, d), f| (a + f.additions, d + f.deletions));
+        let in_sync = status.ahead == 0 && status.behind == 0 && additions == 0 && deletions == 0;
+
+        let (head_icon, head_color) = if in_sync {
+            (IconName::Check, t.green)
+        } else {
+            (IconName::GitBranch, t.blue)
+        };
+        let head_line = div()
+            .flex()
+            .flex_row()
+            .items_center()
+            .gap(px(6.))
+            .child(Icon::new(head_icon, rgb(head_color)).size(px(13.)))
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(rgb(t.text))
+                    .child(default_branch.to_string()),
+            );
+
+        if in_sync {
+            return card
+                .child(head_line)
+                .child(
+                    div()
+                        .text_size(px(10.))
+                        .text_color(rgb(t.overlay2))
+                        .child(format!("in sync with origin/{default_branch}")),
+                )
+                .into_any_element();
+        }
+
+        let mut counts = div().flex().flex_row().items_center().gap(px(10.));
+        if status.ahead > 0 {
+            counts = counts.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(t.yellow))
+                    .child(format!("\u{2191} {} ahead", status.ahead)),
+            );
+        }
+        if status.behind > 0 {
+            counts = counts.child(
+                div()
+                    .text_size(px(11.))
+                    .text_color(rgb(t.yellow))
+                    .child(format!("\u{2193} {} behind", status.behind)),
+            );
+        }
+
+        let stats_line = div()
+            .text_size(px(10.))
+            .text_color(rgb(t.subtext0))
+            .child(format!(
+                "+{additions} / -{deletions}  ·  origin/{default_branch}"
+            ));
+
+        card.child(head_line)
+            .child(counts)
+            .child(stats_line)
+            .into_any_element()
+    }
+
     fn render_right_sidebar(&self, cx: &mut Context<Self>) -> AnyElement {
         let t = theme::theme(cx);
         if self.state.right_sidebar_collapsed {
@@ -3012,11 +3121,28 @@ impl AppView {
                     }
                     RightSidebarTab::Changes => {
                         let active_ws = self.state.active_workspace_id;
-                        let pr =
-                            active_ws.and_then(|id| self.pr_status_by_workspace.get(&id).cloned());
-                        let unavailable = active_ws
-                            .and_then(|id| self.pr_unavailable_by_workspace.get(&id).cloned());
-                        let card = self.render_pr_card(active_ws, pr, unavailable, &t, cx);
+                        // On the default branch we replace the PR card with a
+                        // simple "remote 비교" card; the daemon doesn't poll
+                        // GitHub in that state either.
+                        let default_branch = active_ws
+                            .and_then(|id| self.state.workspaces.iter().find(|w| w.id == id))
+                            .and_then(|ws| {
+                                self.state
+                                    .projects
+                                    .iter()
+                                    .find(|p| p.id == ws.project_id)
+                                    .filter(|p| ws.branch == p.default_branch)
+                                    .map(|p| p.default_branch.clone())
+                            });
+                        let card = if let Some(default_branch) = default_branch {
+                            self.render_remote_compare_card(&default_branch, &t, cx)
+                        } else {
+                            let pr = active_ws
+                                .and_then(|id| self.pr_status_by_workspace.get(&id).cloned());
+                            let unavailable = active_ws
+                                .and_then(|id| self.pr_unavailable_by_workspace.get(&id).cloned());
+                            self.render_pr_card(active_ws, pr, unavailable, &t, cx)
+                        };
                         let panel_el = if let Some(panel) = &self.git_panel {
                             panel.clone().into_any_element()
                         } else {

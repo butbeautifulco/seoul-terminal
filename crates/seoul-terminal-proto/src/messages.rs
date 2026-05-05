@@ -155,6 +155,7 @@ pub struct WorkspaceRegisteredMsg {
     pub workspace_id: Uuid,
     pub working_dir: PathBuf,
     pub branch: String,
+    pub default_branch: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

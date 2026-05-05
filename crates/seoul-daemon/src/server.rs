@@ -572,7 +572,12 @@ async fn client_read_loop(
             }
             MessageType::WorkspaceRegistered => {
                 let msg: WorkspaceRegisteredMsg = decode_or_skip!(frame, WorkspaceRegisteredMsg);
-                poller.register(msg.workspace_id, msg.working_dir, msg.branch);
+                poller.register(
+                    msg.workspace_id,
+                    msg.working_dir,
+                    msg.branch,
+                    msg.default_branch,
+                );
             }
             MessageType::WorkspaceUnregistered => {
                 let msg: WorkspaceUnregisteredMsg =

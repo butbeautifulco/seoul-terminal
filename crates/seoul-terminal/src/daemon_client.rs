@@ -521,11 +521,13 @@ impl DaemonClient {
         workspace_id: Uuid,
         working_dir: PathBuf,
         branch: String,
+        default_branch: String,
     ) -> Result<()> {
         let msg = WorkspaceRegisteredMsg {
             workspace_id,
             working_dir,
             branch,
+            default_branch,
         };
         let frame = Frame::from_msg(MessageType::WorkspaceRegistered, &msg)?;
         self.inner
