@@ -185,9 +185,6 @@ pub struct AppView {
     daemon_client: Option<DaemonClient>,
     /// Shared inner handle for background thread access (set when daemon connects)
     daemon_inner: Option<Arc<DaemonClientInner>>,
-    /// Background daemon connection task
-    #[allow(dead_code)]
-    _daemon_connect_task: Option<Task<()>>,
     /// Tab ID → daemon session ID mapping for persistence
     tab_sessions: HashMap<Uuid, Uuid>,
     /// Tab ID → workspace ID mapping for terminal lifecycle and persistence.
@@ -198,22 +195,14 @@ pub struct AppView {
     pending_serialize: Option<Task<()>>,
     /// Prevents double-close (on_app_quit + Drop)
     closed: bool,
-    #[allow(dead_code)]
-    _quit_subscription: Option<Subscription>,
     // Right sidebar — file tree
     file_tree: Option<Entity<FileTreeView>>,
-    #[allow(dead_code)]
-    _file_tree_subscription: Option<Subscription>,
     /// Subscriptions for settings view events (keyed by tab ID)
     #[allow(dead_code)]
     settings_subscriptions: HashMap<Uuid, Subscription>,
     // Git integration
     git_provider: Option<Entity<GitStateProvider>>,
-    #[allow(dead_code)]
-    _git_subscription: Option<Subscription>,
     git_panel: Option<Entity<crate::git_panel_view::GitPanelView>>,
-    #[allow(dead_code)]
-    _git_panel_subscription: Option<Subscription>,
     right_sidebar_tab: RightSidebarTab,
     // Resource monitor
     resource_indicator: Option<Entity<ResourceIndicator>>,
@@ -223,9 +212,6 @@ pub struct AppView {
     pending_delete_ws: Option<Uuid>,
     // Workspace creation branch name prompt
     new_ws_prompt: Option<NewWorkspacePrompt>,
-    // Daemon health check background task
-    #[allow(dead_code)]
-    _daemon_health_task: Option<Task<()>>,
     /// Session handles from background reattach, ready for in-place attach
     pending_reattach_handles: Vec<(Uuid, DaemonSessionHandle)>,
     /// Terminal tabs with an in-flight full attach request.
@@ -246,9 +232,24 @@ pub struct AppView {
     /// not authenticated, rate-limited). Per-workspace reason lives here too
     /// since the unavailable case is keyed by workspace_id from the daemon.
     pr_unavailable_by_workspace: HashMap<Uuid, PrUnavailableReason>,
-    /// Background task that drains `DaemonClient::try_recv_pr_event`.
+    /// Long-lived subscriptions kept alive for the lifetime of `AppView`
+    /// (or until replaced via a tracked index — see `*_idx` fields below).
+    /// Holds: file tree, quit handler, git state provider, git panel.
     #[allow(dead_code)]
-    _pr_event_task: Option<Task<()>>,
+    _subscriptions: Vec<Subscription>,
+    /// Long-lived background tasks kept alive for the lifetime of `AppView`.
+    /// Holds: daemon connect, daemon health, PR event poll.
+    #[allow(dead_code)]
+    _tasks: Vec<Task<()>>,
+    /// Index of the git state provider subscription within `_subscriptions`,
+    /// so workspace switches can replace it (dropping the prior subscription).
+    git_subscription_idx: Option<usize>,
+    /// Index of the git panel subscription within `_subscriptions`,
+    /// replaced on workspace switch.
+    git_panel_subscription_idx: Option<usize>,
+    /// Index of the PR event poll task within `_tasks`,
+    /// replaced when the daemon reconnects (dropping the prior task).
+    pr_event_task_idx: Option<usize>,
 }
 
 struct NewWorkspacePrompt {
@@ -314,26 +315,20 @@ impl AppView {
             collapsed_projects: Vec::new(),
             daemon_client,
             daemon_inner: None,
-            _daemon_connect_task: None,
             tab_sessions: saved_tab_sessions,
             tab_workspace: saved_tab_workspace,
             closed_tabs: saved_closed_tabs,
             pending_serialize: None,
             closed: false,
-            _quit_subscription: None,
             file_tree: Some(file_tree),
-            _file_tree_subscription: Some(file_tree_sub),
             settings_subscriptions: HashMap::new(),
             git_provider: None,
-            _git_subscription: None,
             git_panel: None,
-            _git_panel_subscription: None,
             right_sidebar_tab: RightSidebarTab::Files,
             resource_indicator: None,
             toast: cx.new(|_cx| ToastManager::new()),
             pending_delete_ws: None,
             new_ws_prompt: None,
-            _daemon_health_task: None,
             pending_reattach_handles: Vec::new(),
             pending_attach_tabs: HashSet::new(),
             pending_ensure_sessions: HashSet::new(),
@@ -343,7 +338,11 @@ impl AppView {
             resize_drag: None,
             pr_status_by_workspace: HashMap::new(),
             pr_unavailable_by_workspace: HashMap::new(),
-            _pr_event_task: None,
+            _subscriptions: vec![file_tree_sub],
+            _tasks: Vec::new(),
+            git_subscription_idx: None,
+            git_panel_subscription_idx: None,
+            pr_event_task_idx: None,
         };
 
         // If daemon client was already provided, still restore the layout as
@@ -367,13 +366,13 @@ impl AppView {
                 }
             }
             // Start background daemon connection
-            app._daemon_connect_task = Some(Self::start_background_connect(cx));
+            app._tasks.push(Self::start_background_connect(cx));
         }
 
         app.init_git_provider(window, cx);
 
         // Register quit handler
-        app._quit_subscription = Some(cx.on_app_quit(|this, cx| {
+        app._subscriptions.push(cx.on_app_quit(|this, cx| {
             this.prepare_to_close(cx);
             async {}
         }));
@@ -390,7 +389,7 @@ impl AppView {
         .detach();
 
         // Daemon health check: detect daemon death and auto-reconnect
-        app._daemon_health_task = Some(Self::start_daemon_health_check(cx));
+        app._tasks.push(Self::start_daemon_health_check(cx));
 
         app
     }
@@ -461,7 +460,16 @@ impl AppView {
             self.sync_workspace_names(cx);
             self.register_all_workspaces_with_daemon();
             self.send_active_workspace_focus();
-            self._pr_event_task = Some(self.start_pr_event_poll(cx));
+            // Replace any prior PR event poll task in-place so the previous task
+            // is dropped (cancellation semantics matter on daemon reconnect).
+            let task = self.start_pr_event_poll(cx);
+            match self.pr_event_task_idx {
+                Some(idx) => self._tasks[idx] = task,
+                None => {
+                    self.pr_event_task_idx = Some(self._tasks.len());
+                    self._tasks.push(task);
+                }
+            }
         }
     }
 
@@ -2009,12 +2017,27 @@ impl AppView {
         let provider = cx.new(|cx| GitStateProvider::new(worktree_path, default_branch, cx));
         let sub = cx.subscribe(&provider, Self::on_git_state_changed);
         self.git_provider = Some(provider);
-        self._git_subscription = Some(sub);
+        // Replace prior git subscription in-place on workspace switch so the
+        // previous one is dropped.
+        match self.git_subscription_idx {
+            Some(idx) => self._subscriptions[idx] = sub,
+            None => {
+                self.git_subscription_idx = Some(self._subscriptions.len());
+                self._subscriptions.push(sub);
+            }
+        }
 
         let panel = cx.new(|cx| crate::git_panel_view::GitPanelView::new(window, cx));
         let panel_sub = cx.subscribe(&panel, Self::on_git_panel_event);
         self.git_panel = Some(panel);
-        self._git_panel_subscription = Some(panel_sub);
+        // Same in-place replacement pattern for the git panel subscription.
+        match self.git_panel_subscription_idx {
+            Some(idx) => self._subscriptions[idx] = panel_sub,
+            None => {
+                self.git_panel_subscription_idx = Some(self._subscriptions.len());
+                self._subscriptions.push(panel_sub);
+            }
+        }
     }
 
     fn on_git_state_changed(
