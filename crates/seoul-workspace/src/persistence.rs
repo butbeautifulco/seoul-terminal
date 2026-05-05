@@ -244,13 +244,30 @@ pub fn add_workspace(state: &mut AppState, ws: Workspace) -> Result<()> {
 
 pub fn save_state(state: &AppState) -> Result<()> {
     let path = state_file_path()?;
+    save_state_to(state, &path)
+}
+
+/// Atomically write `state` as JSON to `path` via tmp+rename.
+///
+/// The tmp file's name is unique per (pid, uuid) so concurrent saves —
+/// across processes (e.g., daemon + app) or across threads in the same
+/// process — never collide on the same tmp slot. Without this, two
+/// concurrent writers could both write to `state.json.tmp` and one would
+/// observe a partially-written file or have its rename race with another
+/// rename, leaving `state.json` corrupted or pointing at stale bytes.
+fn save_state_to(state: &AppState, path: &std::path::Path) -> Result<()> {
     if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent).context("Failed to create .seoul directory")?;
+        std::fs::create_dir_all(parent).context("Failed to create state directory")?;
     }
     let contents = serde_json::to_string(state).context("Failed to serialize state")?;
-    let tmp = path.with_extension("json.tmp");
+    let tmp_name = format!(
+        "json.tmp.{}.{}",
+        std::process::id(),
+        Uuid::new_v4().simple()
+    );
+    let tmp = path.with_extension(tmp_name);
     std::fs::write(&tmp, &contents).context("Failed to write temp state file")?;
-    std::fs::rename(&tmp, &path).context("Failed to rename state file")?;
+    std::fs::rename(&tmp, path).context("Failed to rename state file")?;
     Ok(())
 }
 
@@ -459,5 +476,54 @@ mod tests {
         assert!(value.get("tab_sessions").is_none());
         assert!(value.get("workspace_tab_order").is_none());
         assert!(value.get("workspace_active_tab").is_none());
+    }
+
+    /// Two threads racing on `save_state_to` for the same final path must
+    /// produce a final file that is valid JSON and equals one of the inputs.
+    /// Before the fix both threads would write to the same `state.json.tmp`
+    /// slot and one rename could observe a half-written file.
+    #[test]
+    fn save_state_concurrent_does_not_corrupt() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("state.json");
+
+        // Build two states with a distinguishable field so we can confirm
+        // the final file is one of them, not a corrupted hybrid.
+        let mut s1 = AppState::default();
+        let p1 = fake_project("concurrent-a");
+        s1.projects.push(p1);
+        let mut s2 = AppState::default();
+        let p2 = fake_project("concurrent-b");
+        s2.projects.push(p2);
+
+        let p_a = path.clone();
+        let p_b = path.clone();
+        let s1_clone = s1.clone();
+        let s2_clone = s2.clone();
+        let h1 = std::thread::spawn(move || save_state_to(&s1_clone, &p_a).unwrap());
+        let h2 = std::thread::spawn(move || save_state_to(&s2_clone, &p_b).unwrap());
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        // Final file must exist and parse cleanly as JSON.
+        let txt = std::fs::read_to_string(&path).expect("final state.json must exist");
+        let parsed: AppState =
+            serde_json::from_str(&txt).expect("file must remain valid JSON after concurrent save");
+
+        // And it should match exactly one of the two inputs (no torn bytes).
+        let names: Vec<&str> = parsed.projects.iter().map(|p| p.name.as_str()).collect();
+        assert!(
+            names == vec!["concurrent-a"] || names == vec!["concurrent-b"],
+            "expected one of the saved states, got projects = {names:?}"
+        );
+
+        // No leftover tmp files should remain after both renames succeed.
+        let leftovers: Vec<_> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .filter(|n| n.contains(".tmp"))
+            .collect();
+        assert!(leftovers.is_empty(), "tmp files left behind: {leftovers:?}");
     }
 }
