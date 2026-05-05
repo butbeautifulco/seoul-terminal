@@ -114,7 +114,7 @@ pub struct SessionEnsuredMsg {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DataMsg {
     pub session_id: SessionId,
-    pub data: Vec<u8>,
+    pub data: bytes::Bytes,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

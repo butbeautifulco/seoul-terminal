@@ -16,3 +16,4 @@ dirs.workspace = true
 serde = { workspace = true, features = ["derive"] }
 rmp-serde = "1"
 uuid = { workspace = true, features = ["v4", "serde"] }
+bytes.workspace = true

@@ -625,14 +625,17 @@ impl DaemonClient {
                             senders.get(&msg.session_id).cloned()
                         };
                         if let Some(tx) = tx
-                            && let Err(err) = tx.try_send(msg.data)
+                            && let Err(err) = tx.try_send(msg.data.to_vec())
                         {
                             let reason = match err {
                                 TrySendError::Full(_) => "full",
                                 TrySendError::Closed(_) => "closed",
                             };
-                            let removed =
-                                remove_session_sender_if_same(&session_senders, msg.session_id, &tx);
+                            let removed = remove_session_sender_if_same(
+                                &session_senders,
+                                msg.session_id,
+                                &tx,
+                            );
                             tracing::warn!(
                                 session_id = %msg.session_id,
                                 reason,
@@ -870,7 +873,10 @@ mod tests {
         let (new_tx, _new_rx) = async_channel::bounded::<Vec<u8>>(1);
 
         session_senders.lock().unwrap().insert(session_id, old_tx);
-        session_senders.lock().unwrap().insert(session_id, new_tx.clone());
+        session_senders
+            .lock()
+            .unwrap()
+            .insert(session_id, new_tx.clone());
 
         assert!(!remove_session_sender_if_same(
             &session_senders,
@@ -892,7 +898,10 @@ mod tests {
         let session_senders = Arc::new(Mutex::new(HashMap::new()));
         let (tx, _rx) = async_channel::bounded::<Vec<u8>>(1);
 
-        session_senders.lock().unwrap().insert(session_id, tx.clone());
+        session_senders
+            .lock()
+            .unwrap()
+            .insert(session_id, tx.clone());
 
         assert!(remove_session_sender_if_same(
             &session_senders,

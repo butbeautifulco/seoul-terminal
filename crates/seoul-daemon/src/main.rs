@@ -10,7 +10,6 @@ mod shell_readiness;
 mod transient_errors;
 
 use std::fs;
-use std::fs::File;
 use std::process;
 use std::sync;
 use std::sync::Arc;
@@ -20,6 +19,7 @@ use tokio::net::UnixListener;
 use tokio::signal;
 use tracing::{info, warn};
 
+use seoul_daemon::lock::{self, LockHandle};
 use seoul_terminal_proto::paths;
 use seoul_workspace::git::github_auth;
 use seoul_workspace::git::hosting::HostingRegistry;
@@ -49,22 +49,24 @@ async fn main() -> Result<()> {
 
     let daemon_lock = acquire_daemon_lock()?;
 
-    // Clean up stale socket. The daemon lock/PID check above proved there is
-    // no live owner, so an existing socket is stale.
+    // Clean up stale runtime files. The daemon lock above proved there is
+    // no live owner, so any existing socket/token is stale.
     let socket_path = paths::socket_path();
     if socket_path.exists() {
         fs::remove_file(&socket_path).ok();
     }
-
-    // Generate auth token
-    let token = generate_token();
     let token_path = paths::token_path();
-    fs::write(&token_path, &token).context("failed to write token")?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        fs::set_permissions(&token_path, fs::Permissions::from_mode(0o600)).ok();
+    if token_path.exists() {
+        fs::remove_file(&token_path).ok();
     }
+
+    // Generate auth token. Write atomically with mode 0o600 so the file is
+    // never world-readable even for the brief window between create and
+    // chmod. `create_new` errors if the file already exists, which would
+    // indicate a race with another daemon — but the lock above already
+    // serializes startup, so a present file means cleanup above failed.
+    let token = generate_token();
+    write_token_atomic(&token_path, &token)?;
 
     // Bind socket
     let listener = UnixListener::bind(&socket_path).context("failed to bind Unix socket")?;
@@ -134,55 +136,23 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-fn is_daemon_running() -> bool {
-    let pid_path = paths::pid_path();
-    if let Ok(pid_str) = fs::read_to_string(&pid_path) {
-        if let Ok(pid) = pid_str.trim().parse::<i32>() {
-            // kill(pid, 0) checks if process exists without sending a signal
-            unsafe { libc::kill(pid, 0) == 0 }
-        } else {
-            false
-        }
-    } else {
-        false
-    }
-}
-
-fn acquire_daemon_lock() -> Result<File> {
-    if is_daemon_running() {
-        anyhow::bail!("another daemon is already running");
-    }
-
+/// Acquire the daemon singleton lock and write a PID file for human inspection.
+///
+/// The lock is held by `flock(2)` on the lock file's open fd: the kernel
+/// releases it on close (i.e. on process exit, even via SIGKILL), so a
+/// crashed daemon never wedges the next launch. The PID file is written for
+/// debuggability only — it is no longer the source of truth for "is a
+/// daemon running?".
+fn acquire_daemon_lock() -> Result<LockHandle> {
     let lock_path = paths::lock_path();
-    match fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&lock_path)
-    {
-        Ok(file) => {
-            fs::write(paths::pid_path(), process::id().to_string())
-                .context("failed to write PID file")?;
-            Ok(file)
-        }
-        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
-            if is_daemon_running() {
-                anyhow::bail!("another daemon is already running");
-            }
-            fs::remove_file(&lock_path).ok();
-            fs::remove_file(paths::socket_path()).ok();
-            fs::remove_file(paths::pid_path()).ok();
-            fs::remove_file(paths::token_path()).ok();
-            let file = fs::OpenOptions::new()
-                .write(true)
-                .create_new(true)
-                .open(&lock_path)
-                .context("failed to acquire daemon lock after stale cleanup")?;
-            fs::write(paths::pid_path(), process::id().to_string())
-                .context("failed to write PID file")?;
-            Ok(file)
-        }
-        Err(e) => Err(e).context("failed to acquire daemon lock"),
+    let handle = lock::acquire(&lock_path).context("failed to acquire daemon lock")?;
+
+    // PID file is informational; ignore write failures.
+    if let Err(e) = fs::write(paths::pid_path(), process::id().to_string()) {
+        warn!("failed to write PID file: {e}");
     }
+
+    Ok(handle)
 }
 
 fn generate_token() -> String {
@@ -191,4 +161,32 @@ fn generate_token() -> String {
     (0..32)
         .map(|_| format!("{:02x}", rng.r#gen::<u8>()))
         .collect()
+}
+
+/// Write `token` to `path` atomically with mode 0o600, refusing to clobber.
+///
+/// Uses `O_CREAT | O_EXCL` (`create_new`) so the file is created with the
+/// requested mode in a single syscall — no window where it exists with the
+/// process umask before chmod tightens it. If the file already exists this
+/// returns an error rather than silently truncating, since that indicates
+/// stale runtime state the caller should investigate.
+#[cfg(unix)]
+fn write_token_atomic(path: &std::path::Path, token: &str) -> Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+
+    let mut f = std::fs::OpenOptions::new()
+        .create_new(true)
+        .write(true)
+        .mode(0o600)
+        .open(path)
+        .with_context(|| format!("create token at {}", path.display()))?;
+    f.write_all(token.as_bytes())
+        .with_context(|| format!("write token at {}", path.display()))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn write_token_atomic(path: &std::path::Path, token: &str) -> Result<()> {
+    fs::write(path, token).with_context(|| format!("write token at {}", path.display()))
 }

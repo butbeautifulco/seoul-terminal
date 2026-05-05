@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -9,7 +8,7 @@ use seoul_terminal_proto::messages::*;
 use seoul_terminal_proto::session::{SessionId, SessionStatus};
 
 use crate::resource_monitor::{ResourceMonitor, SessionInfo};
-use crate::session::{self, ClientEvent, ClientHandle, DaemonSession, SessionWriteHandle};
+use crate::session::{ClientEvent, ClientHandle, DaemonSession, SessionWriteHandle};
 
 /// Result of the fast (lock-held) phase of create_or_attach.
 pub enum AttachResult {
@@ -25,6 +24,23 @@ pub enum AttachResult {
     },
 }
 
+/// Inputs to `spawn_inner`, the shared body of `spawn_and_attach` /
+/// `spawn_unattached`. Two distinct messages (`CreateOrAttachMsg` /
+/// `EnsureSessionMsg`) are funnelled through one struct so the spawn
+/// path doesn't carry attach- or ensure-specific fields.
+struct SpawnParams {
+    session_id: SessionId,
+    workspace_id: Uuid,
+    cols: u16,
+    rows: u16,
+    cwd: Option<std::path::PathBuf>,
+    shell: Option<String>,
+    /// When true, the session is being recreated for cold-restore — the
+    /// readiness tracker should not drop terminal-query responses as
+    /// stale because the client just generated fresh ones.
+    was_recovered: bool,
+}
+
 /// Result of the fast phase of ensure_session.
 pub enum EnsureResult {
     /// Session is alive and ready to attach later.
@@ -34,21 +50,20 @@ pub enum EnsureResult {
 }
 
 /// Central manager of all terminal sessions.
+///
+/// Each `DaemonSession` owns its own bounded event channel back to this host
+/// (`event_rx`), so a single backed-up consumer can't head-of-line-block
+/// other sessions' PTY readers. The shared mpsc previously used here was
+/// the source of cross-session interference under heavy output bursts.
 pub struct TerminalHost {
     sessions: HashMap<SessionId, DaemonSession>,
-    /// Channel for PTY reader tasks to send data back to the host.
-    broadcast_tx: mpsc::Sender<(SessionId, ClientEvent)>,
-    broadcast_rx: mpsc::Receiver<(SessionId, ClientEvent)>,
     resource_monitor: ResourceMonitor,
 }
 
 impl TerminalHost {
     pub fn new() -> Self {
-        let (broadcast_tx, broadcast_rx) = mpsc::channel(session::BROADCAST_CHANNEL_CAPACITY);
         Self {
             sessions: HashMap::new(),
-            broadcast_tx,
-            broadcast_rx,
             resource_monitor: ResourceMonitor::new(),
         }
     }
@@ -110,29 +125,21 @@ impl TerminalHost {
         scrollback_data: Vec<u8>,
         was_recovered: bool,
     ) -> Result<SessionAttachedMsg> {
-        let mut session = DaemonSession::spawn(
-            msg.session_id,
-            msg.workspace_id,
-            msg.cols,
-            msg.rows,
-            msg.cwd,
-            msg.shell,
-            self.broadcast_tx.clone(),
-        )?;
+        let scrollback_limit = msg.scrollback_limit_bytes;
+        let session = self.spawn_inner(SpawnParams {
+            session_id: msg.session_id,
+            workspace_id: msg.workspace_id,
+            cols: msg.cols,
+            rows: msg.rows,
+            cwd: msg.cwd,
+            shell: msg.shell,
+            was_recovered,
+        })?;
 
-        // Cold restore: the client's ghostty will generate fresh terminal query
-        // responses (DA1, DSR) for the new shell — don't drop them as stale.
-        if was_recovered {
-            session.disable_stale_response_filter();
-        }
-
-        let mut attached_msg = session.attach(client, msg.scrollback_limit_bytes);
+        let mut attached_msg = session.attach(client, scrollback_limit);
         attached_msg.is_new = true;
         attached_msg.was_recovered = was_recovered;
         attached_msg.scrollback_data = scrollback_data;
-
-        self.sessions.insert(msg.session_id, session);
-        self.resource_monitor.invalidate_cache();
         Ok(attached_msg)
     }
 
@@ -142,17 +149,17 @@ impl TerminalHost {
         msg: EnsureSessionMsg,
         was_recovered: bool,
     ) -> Result<SessionEnsuredMsg> {
-        let session = DaemonSession::spawn(
-            msg.session_id,
-            msg.workspace_id,
-            msg.cols,
-            msg.rows,
-            msg.cwd,
-            msg.shell,
-            self.broadcast_tx.clone(),
-        )?;
+        let session = self.spawn_inner(SpawnParams {
+            session_id: msg.session_id,
+            workspace_id: msg.workspace_id,
+            cols: msg.cols,
+            rows: msg.rows,
+            cwd: msg.cwd,
+            shell: msg.shell,
+            was_recovered,
+        })?;
 
-        let ensured = SessionEnsuredMsg {
+        Ok(SessionEnsuredMsg {
             session_id: session.id,
             is_new: true,
             was_recovered,
@@ -160,11 +167,42 @@ impl TerminalHost {
             rows: session.meta.rows,
             cwd: Some(session.meta.cwd.to_string_lossy().into_owned()),
             foreground_process: session.meta.foreground_process.clone(),
-        };
+        })
+    }
 
-        self.sessions.insert(msg.session_id, session);
+    /// Shared spawn logic for `spawn_and_attach` / `spawn_unattached`.
+    ///
+    /// Builds the PTY-backed session, applies the cold-restore filter
+    /// switch, inserts it into the sessions map, and invalidates the
+    /// resource cache. Returns a `&mut` to the freshly inserted session
+    /// so the caller can perform variant-specific post-processing
+    /// (attaching a client, formatting an `Ensured` reply, etc.) without
+    /// a second map lookup.
+    fn spawn_inner(&mut self, params: SpawnParams) -> Result<&mut DaemonSession> {
+        let session_id = params.session_id;
+        let mut session = DaemonSession::spawn(
+            session_id,
+            params.workspace_id,
+            params.cols,
+            params.rows,
+            params.cwd,
+            params.shell,
+        )?;
+
+        // Cold restore: the client's ghostty will generate fresh terminal
+        // query responses (DA1, DSR) for the new shell — don't drop them
+        // as stale.
+        if params.was_recovered {
+            session.disable_stale_response_filter();
+        }
+
+        self.sessions.insert(session_id, session);
         self.resource_monitor.invalidate_cache();
-        Ok(ensured)
+        // Just inserted — the lookup cannot fail.
+        Ok(self
+            .sessions
+            .get_mut(&session_id)
+            .expect("session inserted moments ago must be present"))
     }
 
     /// Get a reference to a session by ID.
@@ -244,27 +282,34 @@ impl TerminalHost {
     }
 
     /// Process pending PTY output events. Call this in the main loop.
+    ///
+    /// Walks every session and drains its per-session event queue. We
+    /// collect events into a local buffer first so we can release the
+    /// `&mut session.event_rx` borrow before calling `&mut session`
+    /// methods like `on_pty_data` / `on_exit`.
     pub fn drain_broadcast(&mut self) {
-        while let Ok((session_id, event)) = self.broadcast_rx.try_recv() {
-            match event {
-                ClientEvent::Data(data_msg) => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.on_pty_data(data_msg.data);
-                    }
-                }
-                ClientEvent::Exit(exit_msg) => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
+        for session in self.sessions.values_mut() {
+            // Pull all pending events for this session up front. Bounded by
+            // SESSION_EVENT_CHANNEL_CAPACITY so this can't grow unbounded.
+            let mut events: Vec<ClientEvent> = Vec::new();
+            while let Ok(event) = session.event_rx.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    ClientEvent::Data(data_msg) => session.on_pty_data(data_msg.data),
+                    ClientEvent::Exit(exit_msg) => {
                         let code = match exit_msg.status {
                             SessionStatus::Exited { code } => code,
                             _ => 0,
                         };
                         session.on_exit(code);
                     }
+                    // PR status events flow directly from PrPoller → client
+                    // writers and don't pass through per-session channels;
+                    // if one ends up here it's a routing bug — drop it.
+                    ClientEvent::PrStatusUpdated(_) | ClientEvent::PrStatusUnavailable(_) => {}
                 }
-                // PR status events flow directly from PrPoller → client writers
-                // and don't pass through the host's broadcast channel; if one
-                // ends up here it's a routing bug — drop it silently.
-                ClientEvent::PrStatusUpdated(_) | ClientEvent::PrStatusUnavailable(_) => {}
             }
         }
     }

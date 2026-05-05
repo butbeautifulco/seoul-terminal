@@ -22,7 +22,14 @@ use crate::shell_readiness::{ReadyState, ShellReadinessTracker};
 use crate::transient_errors::{self, TransientErrorWindow};
 
 /// Backpressure channel capacities.
-pub const BROADCAST_CHANNEL_CAPACITY: usize = 256;
+///
+/// `SESSION_EVENT_CHANNEL_CAPACITY` is per-session: each `DaemonSession`
+/// owns its own bounded queue from its PTY reader/kill task back to the
+/// host's drain. With one channel per session, a slow consumer for session
+/// A no longer blocks session B's PTY reader on `blocking_send` (the
+/// previous "BROADCAST_CHANNEL_CAPACITY" hop was shared and could
+/// head-of-line-block all sessions on a single backed-up draw cycle).
+pub const SESSION_EVENT_CHANNEL_CAPACITY: usize = 256;
 const CLIENT_EVENT_CHANNEL_CAPACITY: usize = 128;
 const PTY_WRITER_CHANNEL_CAPACITY: usize = 2048;
 /// Consecutive drain cycles where data is dropped before disconnecting a stalled client.
@@ -105,8 +112,13 @@ pub struct DaemonSession {
     shell_ready: Arc<AtomicBool>,
     /// Terminal mode tracker for DECSET/DECRST and OSC-7 CWD.
     mode_tracker: ModeTracker,
-    /// Broadcast channel for sending events back to the host (needed for kill escalation).
-    broadcast_tx: mpsc::Sender<(SessionId, ClientEvent)>,
+    /// Per-session event sender — cloned into the PTY reader and kill
+    /// escalation tasks. Receivers are drained by the host (`event_rx`).
+    /// One channel per session means a backed-up consumer for session A
+    /// cannot block session B's PTY reader on `blocking_send`.
+    event_tx: mpsc::Sender<ClientEvent>,
+    /// Per-session event receiver, drained by `TerminalHost::drain_broadcast`.
+    pub(crate) event_rx: mpsc::Receiver<ClientEvent>,
     /// Tokio task handle for the PTY reader loop
     _reader_task: tokio::task::JoinHandle<()>,
     /// Tokio task handle for the PTY writer loop
@@ -124,7 +136,6 @@ impl DaemonSession {
         rows: u16,
         cwd: Option<std::path::PathBuf>,
         shell: Option<String>,
-        broadcast_tx: mpsc::Sender<(SessionId, ClientEvent)>,
     ) -> Result<Self> {
         let pty_system = native_pty_system();
         let pty_size = PtySize {
@@ -187,11 +198,17 @@ impl DaemonSession {
         // Save initial metadata
         save_meta(&meta);
 
+        // Per-session event channel. Producers: PTY reader, kill escalation
+        // task. Consumer: `TerminalHost::drain_broadcast`. Each session has
+        // its own channel so a backed-up drain for one session can't block
+        // another session's PTY reader on `blocking_send`.
+        let (event_tx, event_rx) = mpsc::channel::<ClientEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+
         // Spawn PTY reader task
-        let session_id = id;
-        let broadcast_tx_for_session = broadcast_tx.clone();
+        let reader_event_tx = event_tx.clone();
+        let session_id_for_reader = id;
         let reader_task = tokio::task::spawn_blocking(move || {
-            pty_reader_loop(session_id, reader, broadcast_tx);
+            pty_reader_loop(session_id_for_reader, reader, reader_event_tx);
         });
 
         // Spawn per-session PTY writer task (owns pty_writer, receives data via channel)
@@ -210,7 +227,8 @@ impl DaemonSession {
             pty_master: pair.master,
             child_pid,
             attached_clients: Vec::new(),
-            broadcast_tx: broadcast_tx_for_session,
+            event_tx,
+            event_rx,
             scrollback_writer,
             readiness,
             shell_ready,
@@ -339,9 +357,9 @@ impl DaemonSession {
     }
 
     /// Handle PTY output data: write to scrollback and broadcast to attached clients.
-    pub fn on_pty_data(&mut self, data: Vec<u8>) {
+    pub fn on_pty_data(&mut self, data: bytes::Bytes) {
         // Fast path: skip marker scanning when shell is already ready
-        let forward = if self.readiness.is_active() {
+        let forward: bytes::Bytes = if self.readiness.is_active() {
             let scan = self.readiness.scan_output(&data);
             if scan.became_ready {
                 debug!(session_id = %self.id, "shell ready detected");
@@ -350,7 +368,8 @@ impl DaemonSession {
             if scan.forward.is_empty() {
                 return; // marker consumed entire chunk
             }
-            scan.forward
+            // scan.forward is a freshly-built Vec<u8>; wrap it in Bytes (no copy).
+            bytes::Bytes::from(scan.forward)
         } else {
             data
         };
@@ -367,7 +386,8 @@ impl DaemonSession {
         }
 
         // Broadcast to attached clients with backpressure.
-        // Avoid cloning on the last (usually only) client by moving the data.
+        // Bytes clone is a refcount bump (cheap) so each client gets its own
+        // handle without copying the chunk bytes.
         let mut msg = Some(DataMsg {
             session_id: self.id,
             data: forward,
@@ -433,7 +453,7 @@ impl DaemonSession {
 
         let pid = self.child_pid;
         let session_id = self.id;
-        let broadcast_tx = self.broadcast_tx.clone();
+        let event_tx = self.event_tx.clone();
 
         // Send SIGTERM immediately
         #[cfg(unix)]
@@ -469,10 +489,7 @@ impl DaemonSession {
                 session_id,
                 status: SessionStatus::Exited { code: -9 },
             };
-            broadcast_tx
-                .send((session_id, ClientEvent::Exit(msg)))
-                .await
-                .ok();
+            event_tx.send(ClientEvent::Exit(msg)).await.ok();
         });
 
         self._kill_task = Some(task);
@@ -518,11 +535,15 @@ impl DaemonSession {
     }
 }
 
-/// Background loop that reads PTY output and sends it to the host via channel.
+/// Background loop that reads PTY output and sends it to the host via the
+/// session's per-session event channel. Backpressure: when the channel is
+/// full, `blocking_send` parks this thread → kernel PTY buffer fills →
+/// subprocess stdout blocks. Per-session channels mean a slow drain for
+/// session A can't park session B's reader here.
 fn pty_reader_loop(
     session_id: SessionId,
     mut reader: Box<dyn std::io::Read + Send>,
-    broadcast_tx: mpsc::Sender<(SessionId, ClientEvent)>,
+    event_tx: mpsc::Sender<ClientEvent>,
 ) {
     let mut buf = [0u8; 4096];
     let mut transient_window = TransientErrorWindow::new();
@@ -534,22 +555,15 @@ fn pty_reader_loop(
                     session_id,
                     status: SessionStatus::Exited { code: 0 },
                 };
-                broadcast_tx
-                    .blocking_send((session_id, ClientEvent::Exit(msg)))
-                    .ok();
+                event_tx.blocking_send(ClientEvent::Exit(msg)).ok();
                 break;
             }
             Ok(n) => {
                 let msg = DataMsg {
                     session_id,
-                    data: buf[..n].to_vec(),
+                    data: bytes::Bytes::copy_from_slice(&buf[..n]),
                 };
-                // blocking_send: blocks when channel full → kernel PTY buffer fills
-                // → subprocess stdout blocks = backpressure
-                if broadcast_tx
-                    .blocking_send((session_id, ClientEvent::Data(msg)))
-                    .is_err()
-                {
+                if event_tx.blocking_send(ClientEvent::Data(msg)).is_err() {
                     break;
                 }
             }
@@ -560,9 +574,7 @@ fn pty_reader_loop(
                         session_id,
                         status: SessionStatus::Exited { code: -1 },
                     };
-                    broadcast_tx
-                        .blocking_send((session_id, ClientEvent::Exit(msg)))
-                        .ok();
+                    event_tx.blocking_send(ClientEvent::Exit(msg)).ok();
                     break;
                 }
                 warn!(session_id = %session_id, "transient PTY read error (continuing): {e}");
@@ -574,9 +586,7 @@ fn pty_reader_loop(
                     session_id,
                     status: SessionStatus::Exited { code: -1 },
                 };
-                broadcast_tx
-                    .blocking_send((session_id, ClientEvent::Exit(msg)))
-                    .ok();
+                event_tx.blocking_send(ClientEvent::Exit(msg)).ok();
                 break;
             }
         }
@@ -655,4 +665,69 @@ fn epoch_secs_string() -> String {
         .unwrap_or_default()
         .as_secs();
     secs.to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use seoul_terminal_proto::messages::DataMsg;
+
+    /// Each session owns its own bounded event channel. Filling one
+    /// session's queue must not affect another session's queue — that
+    /// independence is the entire point of moving away from the previous
+    /// shared `(SessionId, ClientEvent)` mpsc channel, where a backed-up
+    /// drain for any one session would block every other session's PTY
+    /// reader on `blocking_send`.
+    #[test]
+    fn per_session_channels_are_independent() {
+        // Build two channels at the same capacity used in production.
+        let (tx_a, mut rx_a) = mpsc::channel::<ClientEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+        let (tx_b, mut rx_b) = mpsc::channel::<ClientEvent>(SESSION_EVENT_CHANNEL_CAPACITY);
+        let id_a = SessionId::new_v4();
+        let id_b = SessionId::new_v4();
+
+        // Fill A's channel to capacity. Every send must succeed.
+        for _ in 0..SESSION_EVENT_CHANNEL_CAPACITY {
+            tx_a.try_send(ClientEvent::Data(DataMsg {
+                session_id: id_a,
+                data: bytes::Bytes::from_static(b"a"),
+            }))
+            .expect("A: send within capacity must succeed");
+        }
+        // One more send to A would now fail — proves A is saturated.
+        assert!(
+            matches!(
+                tx_a.try_send(ClientEvent::Data(DataMsg {
+                    session_id: id_a,
+                    data: bytes::Bytes::from_static(b"a"),
+                })),
+                Err(mpsc::error::TrySendError::Full(_))
+            ),
+            "A must be full at capacity"
+        );
+
+        // B is untouched — sending on it must still succeed even though A
+        // is jammed. With a single shared channel this would have failed.
+        tx_b.try_send(ClientEvent::Data(DataMsg {
+            session_id: id_b,
+            data: bytes::Bytes::from_static(b"b"),
+        }))
+        .expect("B's channel must be unaffected by A's saturation");
+
+        // Drain B and confirm we get exactly the bytes we sent into B.
+        let evt = rx_b.try_recv().expect("B has one pending event");
+        match evt {
+            ClientEvent::Data(d) => {
+                assert_eq!(d.session_id, id_b);
+                assert_eq!(d.data.as_ref(), b"b");
+            }
+            other => panic!("expected Data, got {other:?}"),
+        }
+        // And A still has all its events queued (untouched by B's drain).
+        let mut drained = 0;
+        while rx_a.try_recv().is_ok() {
+            drained += 1;
+        }
+        assert_eq!(drained, SESSION_EVENT_CHANNEL_CAPACITY);
+    }
 }
