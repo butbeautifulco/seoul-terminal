@@ -30,10 +30,10 @@ pub struct ScrollbackWriter {
 
 impl ScrollbackWriter {
     pub fn new(session_id: Uuid) -> io::Result<Self> {
-        let dir = paths::session_history_dir(session_id);
+        let dir = paths::session_history_dir(session_id).map_err(io::Error::other)?;
         fs::create_dir_all(&dir)?;
 
-        let path = paths::scrollback_path(session_id);
+        let path = paths::scrollback_path(session_id).map_err(io::Error::other)?;
         let file = OpenOptions::new().create(true).append(true).open(&path)?;
 
         let bytes_written = file.metadata().map(|m| m.len() as usize).unwrap_or(0);
@@ -87,7 +87,7 @@ impl ScrollbackWriter {
     /// Read scrollback from disk, capped by the requested send size and the
     /// daemon's hard maximum.
     pub fn read_scrollback_with_limit(session_id: Uuid, limit: usize) -> io::Result<Vec<u8>> {
-        let path = paths::scrollback_path(session_id);
+        let path = paths::scrollback_path(session_id).map_err(io::Error::other)?;
         if !path.exists() {
             return Ok(Vec::new());
         }

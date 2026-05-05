@@ -344,7 +344,13 @@ impl TerminalHost {
 
     /// Clean up old scrollback files (older than 7 days).
     pub fn cleanup_old_scrollback(&self) {
-        let history_dir = seoul_terminal_proto::paths::terminal_history_dir();
+        let history_dir = match seoul_terminal_proto::paths::terminal_history_dir() {
+            Ok(d) => d,
+            Err(e) => {
+                tracing::warn!("cleanup_old_scrollback: {e}");
+                return;
+            }
+        };
         if !history_dir.exists() {
             return;
         }
@@ -383,7 +389,7 @@ impl TerminalHost {
 pub fn load_saved_meta(
     session_id: SessionId,
 ) -> Option<seoul_terminal_proto::session::SessionMeta> {
-    let meta_path = seoul_terminal_proto::paths::meta_path(session_id);
+    let meta_path = seoul_terminal_proto::paths::meta_path(session_id).ok()?;
     let contents = std::fs::read_to_string(meta_path).ok()?;
     serde_json::from_str(&contents).ok()
 }

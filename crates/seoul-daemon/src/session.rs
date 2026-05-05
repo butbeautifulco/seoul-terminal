@@ -512,8 +512,12 @@ impl DaemonSession {
     /// Called by TerminalHost right before the session is dropped.
     pub fn cleanup_on_kill(&mut self) {
         save_meta(&self.meta);
-        let scrollback_path = paths::scrollback_path(self.id);
-        std::fs::remove_file(&scrollback_path).ok();
+        match paths::scrollback_path(self.id) {
+            Ok(p) => {
+                std::fs::remove_file(&p).ok();
+            }
+            Err(e) => warn!(session_id = %self.id, "cleanup_on_kill: {e}"),
+        }
     }
 
     /// Check if shell readiness has timed out.
@@ -649,12 +653,18 @@ fn is_process_alive(pid: u32) -> bool {
 }
 
 fn save_meta(meta: &SessionMeta) {
-    let dir = paths::session_history_dir(meta.session_id);
-    if std::fs::create_dir_all(&dir).is_ok() {
-        let path = paths::meta_path(meta.session_id);
-        if let Ok(json) = serde_json::to_string(meta) {
-            std::fs::write(path, json).ok();
+    let dir = match paths::session_history_dir(meta.session_id) {
+        Ok(d) => d,
+        Err(e) => {
+            warn!(session_id = %meta.session_id, "save_meta: {e}");
+            return;
         }
+    };
+    if std::fs::create_dir_all(&dir).is_ok()
+        && let Ok(path) = paths::meta_path(meta.session_id)
+        && let Ok(json) = serde_json::to_string(meta)
+    {
+        std::fs::write(path, json).ok();
     }
 }
 

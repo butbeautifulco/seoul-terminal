@@ -27,11 +27,11 @@ use seoul_workspace::git::providers::GitHubProvider;
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let seoul_dir = paths::seoul_dir();
+    let seoul_dir = paths::seoul_dir()?;
     fs::create_dir_all(&seoul_dir).context("failed to create ~/.seoul")?;
 
     // Log to file (~/.seoul/daemon.log) since the process runs with null stdio.
-    let log_path = paths::daemon_log_path();
+    let log_path = paths::daemon_log_path()?;
     if let Ok(meta) = fs::metadata(&log_path)
         && meta.len() > 10 * 1024 * 1024
     {
@@ -51,11 +51,11 @@ async fn main() -> Result<()> {
 
     // Clean up stale runtime files. The daemon lock above proved there is
     // no live owner, so any existing socket/token is stale.
-    let socket_path = paths::socket_path();
+    let socket_path = paths::socket_path()?;
     if socket_path.exists() {
         fs::remove_file(&socket_path).ok();
     }
-    let token_path = paths::token_path();
+    let token_path = paths::token_path()?;
     if token_path.exists() {
         fs::remove_file(&token_path).ok();
     }
@@ -122,8 +122,12 @@ async fn main() -> Result<()> {
     // Remove runtime files FIRST so a new daemon can start immediately,
     // then do the slow cleanup (scrollback flush, session kill).
     fs::remove_file(&socket_path).ok();
-    fs::remove_file(paths::pid_path()).ok();
-    fs::remove_file(paths::lock_path()).ok();
+    if let Ok(p) = paths::pid_path() {
+        fs::remove_file(p).ok();
+    }
+    if let Ok(p) = paths::lock_path() {
+        fs::remove_file(p).ok();
+    }
     drop(daemon_lock);
     info!("runtime files removed, flushing scrollback");
 
@@ -144,11 +148,12 @@ async fn main() -> Result<()> {
 /// debuggability only — it is no longer the source of truth for "is a
 /// daemon running?".
 fn acquire_daemon_lock() -> Result<LockHandle> {
-    let lock_path = paths::lock_path();
+    let lock_path = paths::lock_path()?;
     let handle = lock::acquire(&lock_path).context("failed to acquire daemon lock")?;
 
     // PID file is informational; ignore write failures.
-    if let Err(e) = fs::write(paths::pid_path(), process::id().to_string()) {
+    let pid_path = paths::pid_path()?;
+    if let Err(e) = fs::write(pid_path, process::id().to_string()) {
         warn!("failed to write PID file: {e}");
     }
 
