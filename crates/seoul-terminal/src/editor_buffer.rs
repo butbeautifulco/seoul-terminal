@@ -32,7 +32,6 @@ impl EditorBuffer {
         &self.rope
     }
 
-    #[allow(dead_code)]
     pub fn version(&self) -> u64 {
         self.version
     }
