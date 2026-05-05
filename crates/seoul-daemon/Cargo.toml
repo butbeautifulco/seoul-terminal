@@ -31,3 +31,4 @@ rand.workspace = true
 libc.workspace = true
 octocrab.workspace = true
 async-trait.workspace = true
+bytes.workspace = true

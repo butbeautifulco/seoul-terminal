@@ -339,9 +339,9 @@ impl DaemonSession {
     }
 
     /// Handle PTY output data: write to scrollback and broadcast to attached clients.
-    pub fn on_pty_data(&mut self, data: Vec<u8>) {
+    pub fn on_pty_data(&mut self, data: bytes::Bytes) {
         // Fast path: skip marker scanning when shell is already ready
-        let forward = if self.readiness.is_active() {
+        let forward: bytes::Bytes = if self.readiness.is_active() {
             let scan = self.readiness.scan_output(&data);
             if scan.became_ready {
                 debug!(session_id = %self.id, "shell ready detected");
@@ -350,7 +350,8 @@ impl DaemonSession {
             if scan.forward.is_empty() {
                 return; // marker consumed entire chunk
             }
-            scan.forward
+            // scan.forward is a freshly-built Vec<u8>; wrap it in Bytes (no copy).
+            bytes::Bytes::from(scan.forward)
         } else {
             data
         };
@@ -367,7 +368,8 @@ impl DaemonSession {
         }
 
         // Broadcast to attached clients with backpressure.
-        // Avoid cloning on the last (usually only) client by moving the data.
+        // Bytes clone is a refcount bump (cheap) so each client gets its own
+        // handle without copying the chunk bytes.
         let mut msg = Some(DataMsg {
             session_id: self.id,
             data: forward,
@@ -542,7 +544,7 @@ fn pty_reader_loop(
             Ok(n) => {
                 let msg = DataMsg {
                     session_id,
-                    data: buf[..n].to_vec(),
+                    data: bytes::Bytes::copy_from_slice(&buf[..n]),
                 };
                 // blocking_send: blocks when channel full → kernel PTY buffer fills
                 // → subprocess stdout blocks = backpressure

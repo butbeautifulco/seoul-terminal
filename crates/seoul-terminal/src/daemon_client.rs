@@ -604,7 +604,11 @@ impl DaemonClient {
                     if let Ok(msg) = frame.decode_msg::<DataMsg>() {
                         let senders = session_senders.lock().unwrap();
                         if let Some(tx) = senders.get(&msg.session_id) {
-                            tx.send_blocking(msg.data).ok();
+                            // Convert Bytes back to Vec<u8> at the client boundary so
+                            // the existing Vec<u8>-based UI plumbing is unaffected.
+                            // The daemon-side hot path (per-read alloc, broadcast
+                            // clone) is what benefits from Bytes.
+                            tx.send_blocking(msg.data.to_vec()).ok();
                         }
                     }
                 }
