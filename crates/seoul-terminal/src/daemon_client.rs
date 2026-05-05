@@ -813,51 +813,6 @@ impl DaemonClientInner {
             attached_msg: attached,
         })
     }
-
-    pub fn ensure_session(
-        inner: &Arc<Self>,
-        session_id: SessionId,
-        workspace_id: Uuid,
-        cols: u16,
-        rows: u16,
-        cwd: Option<PathBuf>,
-    ) -> Result<SessionEnsuredMsg> {
-        let msg = EnsureSessionMsg {
-            session_id,
-            workspace_id,
-            cols,
-            rows,
-            cwd,
-            shell: None,
-        };
-
-        let (response_tx, response_rx) = mpsc::channel();
-        {
-            let mut pending = inner.pending_requests.lock().unwrap();
-            pending.insert(session_id, response_tx);
-        }
-
-        let frame = Frame::from_msg(MessageType::EnsureSession, &msg)?;
-        inner
-            .writer_tx
-            .send(OutgoingMessage::Raw(frame))
-            .context("daemon writer channel closed")?;
-
-        let response = response_rx
-            .recv_timeout(Duration::from_secs(5))
-            .context("timed out waiting for ensure session response")?;
-
-        if response.message_type == MessageType::Error {
-            let err: ErrorMsg = response.decode_msg()?;
-            bail!("failed to ensure session: {}", err.message);
-        }
-
-        if response.message_type != MessageType::SessionEnsured {
-            bail!("unexpected response type: {:?}", response.message_type);
-        }
-
-        response.decode_msg()
-    }
 }
 
 #[cfg(test)]

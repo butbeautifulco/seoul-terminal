@@ -132,6 +132,16 @@ impl MouseButtonsPressed {
     }
 }
 
+enum MappedKeystroke {
+    Encoded {
+        key: gkey::Key,
+        mods: gkey::Mods,
+        utf8: Option<String>,
+        unshifted: Option<char>,
+    },
+    Raw(&'static [u8]),
+}
+
 impl TerminalView {
     fn config_from_settings(cx: &App) -> TerminalConfig {
         let s = cx.global::<SettingsStore>().global().terminal.clone();
@@ -629,13 +639,13 @@ impl TerminalView {
         terminal: &mut Terminal,
         attached_msg: &seoul_terminal_proto::messages::SessionAttachedMsg,
     ) {
-        if !attached_msg.rehydrate_sequences.is_empty() {
-            terminal.feed_pty_data_silently(&attached_msg.rehydrate_sequences);
-        }
-
         if !attached_msg.scrollback_data.is_empty() {
             terminal.feed_pty_data_silently(&attached_msg.scrollback_data);
             terminal.feed_pty_data_silently(b"\x1b[?25h");
+        }
+
+        if !attached_msg.rehydrate_sequences.is_empty() {
+            terminal.feed_pty_data_silently(&attached_msg.rehydrate_sequences);
         }
 
         if attached_msg.was_recovered {
@@ -645,23 +655,29 @@ impl TerminalView {
             if terminal.is_bracketed_paste() {
                 terminal.feed_pty_data_silently(b"\x1b[?2004l");
             }
-            if terminal.is_mouse_tracking() {
-                terminal.feed_pty_data_silently(b"\x1b[?9l");
-                terminal.feed_pty_data_silently(b"\x1b[?1000l");
-                terminal.feed_pty_data_silently(b"\x1b[?1002l");
-                terminal.feed_pty_data_silently(b"\x1b[?1003l");
-                terminal.feed_pty_data_silently(b"\x1b[?1005l");
-                terminal.feed_pty_data_silently(b"\x1b[?1006l");
-                terminal.feed_pty_data_silently(b"\x1b[?1015l");
-                terminal.feed_pty_data_silently(b"\x1b[?1016l");
-            }
+            terminal.feed_pty_data_silently(b"\x1b[?9l");
+            terminal.feed_pty_data_silently(b"\x1b[?1000l");
+            terminal.feed_pty_data_silently(b"\x1b[?1002l");
+            terminal.feed_pty_data_silently(b"\x1b[?1003l");
+            terminal.feed_pty_data_silently(b"\x1b[?1004l");
+            terminal.feed_pty_data_silently(b"\x1b[?1005l");
+            terminal.feed_pty_data_silently(b"\x1b[?1006l");
+            terminal.feed_pty_data_silently(b"\x1b[?1007h");
+            terminal.feed_pty_data_silently(b"\x1b[?1015l");
+            terminal.feed_pty_data_silently(b"\x1b[?1016l");
             terminal.feed_pty_data_silently(b"\x1b[?2026l");
             terminal.feed_pty_data_silently(b"\x1b[?2048l");
+            terminal.feed_pty_data_silently(b"\x1b[>4m");
+            terminal.feed_pty_data_silently(b"\x1b[<8u");
+            terminal.feed_pty_data_silently(b"\x1b[=0;1u");
             terminal.feed_pty_data_silently(b"\x1b[?1l");
             terminal.feed_pty_data_silently(b"\x1b[?66l");
             terminal.feed_pty_data_silently(b"\x1b[?5l");
             terminal.feed_pty_data_silently(b"\x1b[?6l");
             terminal.feed_pty_data_silently(b"\x1b[?25h");
+            let rows = terminal.last_content.terminal_bounds.rows.max(1);
+            let live_prompt_boundary = format!("\x1b[0m\x1b[r\x1b[{};1H\r\n", rows);
+            terminal.feed_pty_data_silently(live_prompt_boundary.as_bytes());
         }
 
         terminal.sync();
@@ -1403,18 +1419,21 @@ impl TerminalView {
 
     /// Map a GPUI keystroke to libghostty key + mods.
     ///
-    /// Only handles special keys and modifier combos (Ctrl+X, Alt+X).
+    /// Only handles special keys and modifier combos (Ctrl+X, Alt+X, Cmd+Arrow).
     /// Regular printable characters (no Ctrl/Alt) are left to the IME
     /// InputHandler path (replace_text_in_range) to avoid double input.
-    fn map_keystroke(
-        keystroke: &Keystroke,
-    ) -> Option<(gkey::Key, gkey::Mods, Option<String>, Option<char>)> {
-        if keystroke.modifiers.platform {
-            return None;
-        }
-
+    fn map_keystroke(keystroke: &Keystroke) -> Option<MappedKeystroke> {
         let has_ctrl = keystroke.modifiers.control;
         let has_alt = keystroke.modifiers.alt;
+        let has_platform = keystroke.modifiers.platform;
+
+        if has_platform && !has_ctrl && !has_alt && !keystroke.modifiers.shift {
+            match keystroke.key.as_str() {
+                "left" | "up" => return Some(MappedKeystroke::Raw(b"\x01")),
+                "right" | "down" => return Some(MappedKeystroke::Raw(b"\x05")),
+                _ => {}
+            }
+        }
 
         let mut mods = gkey::Mods::empty();
         if has_ctrl {
@@ -1422,6 +1441,9 @@ impl TerminalView {
         }
         if has_alt {
             mods |= gkey::Mods::ALT;
+        }
+        if has_platform {
+            mods |= gkey::Mods::SUPER;
         }
         if keystroke.modifiers.shift {
             mods |= gkey::Mods::SHIFT;
@@ -1555,7 +1577,36 @@ impl TerminalView {
         };
 
         let utf8 = keystroke.key_char.as_ref().map(|s| s.to_string());
-        Some((key, mods, utf8, unshifted))
+        Some(MappedKeystroke::Encoded {
+            key,
+            mods,
+            utf8,
+            unshifted,
+        })
+    }
+
+    fn dispatch_mapped_keystroke(
+        terminal: &mut Terminal,
+        mapped: MappedKeystroke,
+        ime_preedit: &mut String,
+    ) -> bool {
+        if !ime_preedit.is_empty() {
+            let text = std::mem::take(ime_preedit);
+            terminal.input(text.as_bytes());
+        }
+
+        match mapped {
+            MappedKeystroke::Encoded {
+                key,
+                mods,
+                utf8,
+                unshifted,
+            } => terminal.try_keystroke(key, mods, utf8.as_deref(), unshifted),
+            MappedKeystroke::Raw(bytes) => {
+                terminal.input(bytes);
+                true
+            }
+        }
     }
 }
 
@@ -1577,9 +1628,29 @@ impl crate::item::Item for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalView;
+    use super::{MappedKeystroke, TerminalView};
     use gpui::{Keystroke, px, size};
-    use libghostty_vt::key as gkey;
+    use libghostty_vt::{key as gkey, mouse};
+    use seoul_terminal_proto::messages::SessionAttachedMsg;
+    use seoul_vt::TerminalBuilder;
+    use seoul_vt::config::TerminalConfig;
+    use std::io::{self, Write};
+    use std::sync::{Arc, Mutex};
+    use uuid::Uuid;
+
+    #[derive(Clone, Default)]
+    struct CaptureWriter(Arc<Mutex<Vec<u8>>>);
+
+    impl Write for CaptureWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().extend_from_slice(buf);
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Ok(())
+        }
+    }
 
     fn keystroke(key: &str) -> Keystroke {
         Keystroke {
@@ -1599,19 +1670,93 @@ mod tests {
         }
     }
 
+    fn cmd_keystroke(key: &str) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            modifiers: gpui::Modifiers {
+                platform: true,
+                ..gpui::Modifiers::default()
+            },
+            ..Keystroke::default()
+        }
+    }
+
+    fn attached_msg(
+        scrollback_data: Vec<u8>,
+        rehydrate_sequences: Vec<u8>,
+        was_recovered: bool,
+    ) -> SessionAttachedMsg {
+        SessionAttachedMsg {
+            session_id: Uuid::new_v4(),
+            is_new: false,
+            was_recovered,
+            scrollback_data,
+            cols: 80,
+            rows: 24,
+            cwd: None,
+            foreground_process: None,
+            rehydrate_sequences,
+        }
+    }
+
+    fn attached_terminal() -> seoul_vt::Terminal {
+        TerminalBuilder::new(TerminalConfig::default())
+            .build_attached(Box::new(std::io::sink()))
+            .expect("attached test terminal should build")
+    }
+
+    fn captured_attached_terminal() -> (seoul_vt::Terminal, Arc<Mutex<Vec<u8>>>) {
+        let captured = Arc::new(Mutex::new(Vec::new()));
+        let writer = CaptureWriter(captured.clone());
+        let terminal = TerminalBuilder::new(TerminalConfig::default())
+            .build_attached(Box::new(writer))
+            .expect("attached test terminal should build");
+        (terminal, captured)
+    }
+
+    fn take(captured: &Arc<Mutex<Vec<u8>>>) -> Vec<u8> {
+        std::mem::take(&mut *captured.lock().unwrap())
+    }
+
+    fn terminal_text(terminal: &seoul_vt::Terminal) -> String {
+        terminal
+            .last_content
+            .cells
+            .iter()
+            .map(|row| {
+                row.iter()
+                    .flat_map(|cell| cell.graphemes.iter())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     #[test]
     fn maps_additional_fixed_keys() {
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("insert")),
-            Some((gkey::Key::Insert, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::Insert,
+                unshifted: None,
+                ..
+            })
         ));
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("f13")),
-            Some((gkey::Key::F13, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::F13,
+                unshifted: None,
+                ..
+            })
         ));
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("numpad_add")),
-            Some((gkey::Key::NumpadAdd, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::NumpadAdd,
+                unshifted: None,
+                ..
+            })
         ));
     }
 
@@ -1619,8 +1764,62 @@ mod tests {
     fn maps_unshifted_for_single_character_keys() {
         assert!(matches!(
             TerminalView::map_keystroke(&ctrl_keystroke("A")),
-            Some((gkey::Key::A, _, _, Some('a')))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::A,
+                unshifted: Some('a'),
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn cmd_arrow_keys_map_to_shell_line_navigation() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("left")),
+            Some(MappedKeystroke::Raw(b"\x01"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("up")),
+            Some(MappedKeystroke::Raw(b"\x01"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("right")),
+            Some(MappedKeystroke::Raw(b"\x05"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("down")),
+            Some(MappedKeystroke::Raw(b"\x05"))
+        ));
+    }
+
+    #[test]
+    fn cmd_printable_keys_stay_reserved_for_keybindings() {
+        assert!(TerminalView::map_keystroke(&cmd_keystroke("s")).is_none());
+    }
+
+    #[test]
+    fn cmd_non_arrow_special_keys_keep_super_modifier() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("home")),
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::Home,
+                mods,
+                ..
+            }) if mods.contains(gkey::Mods::SUPER)
+        ));
+    }
+
+    #[test]
+    fn raw_mapped_keystrokes_write_to_terminal() {
+        let (mut terminal, captured) = captured_attached_terminal();
+        let mut ime_preedit = String::new();
+
+        assert!(TerminalView::dispatch_mapped_keystroke(
+            &mut terminal,
+            MappedKeystroke::Raw(b"\x01"),
+            &mut ime_preedit,
+        ));
+        assert_eq!(take(&captured), b"\x01");
     }
 
     #[test]
@@ -1636,6 +1835,104 @@ mod tests {
         assert_eq!(encoder_size.padding_bottom, 0);
         assert_eq!(encoder_size.padding_left, 0);
         assert_eq!(encoder_size.padding_right, 0);
+    }
+
+    #[test]
+    fn warm_attach_rehydrate_overrides_stale_scrollback_mouse_modes() {
+        let mut terminal = attached_terminal();
+        let msg = attached_msg(
+            b"\x1b[?1000l".to_vec(),
+            b"\x1b[?1000h\x1b[?1006h".to_vec(),
+            false,
+        );
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        assert!(terminal.is_mouse_tracking());
+    }
+
+    #[test]
+    fn warm_attach_rehydrated_mouse_modes_emit_mouse_events() {
+        let (mut terminal, captured) = captured_attached_terminal();
+        let msg = attached_msg(Vec::new(), b"\x1b[?1003h\x1b[?1006h".to_vec(), false);
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        terminal.set_mouse_size(mouse::EncoderSize {
+            screen_width: 800,
+            screen_height: 400,
+            cell_width: 10,
+            cell_height: 20,
+            padding_top: 0,
+            padding_bottom: 0,
+            padding_right: 0,
+            padding_left: 0,
+        });
+        terminal.send_mouse_event(
+            mouse::Action::Press,
+            Some(mouse::Button::Left),
+            gkey::Mods::empty(),
+            15.0,
+            25.0,
+        );
+
+        assert_eq!(take(&captured), b"\x1b[<0;2;2M");
+    }
+
+    #[test]
+    fn warm_attach_rehydrate_overrides_stale_scrollback_alt_scroll_modes() {
+        let mut terminal = attached_terminal();
+        let msg = attached_msg(b"\x1b[?1007h".to_vec(), b"\x1b[?1007l".to_vec(), false);
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        assert!(!terminal.is_alt_scroll());
+    }
+
+    #[test]
+    fn cold_restore_clears_stale_scrollback_mouse_tracking() {
+        let mut terminal = attached_terminal();
+        let msg = attached_msg(b"\x1b[?1000h\x1b[?1006h".to_vec(), Vec::new(), true);
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        assert!(!terminal.is_mouse_tracking());
+    }
+
+    #[test]
+    fn cold_restore_resets_keyboard_protocol_before_shell_input() {
+        let (mut terminal, captured) = captured_attached_terminal();
+        let msg = attached_msg(b"\x1b[>3u\x1b[>4;2m".to_vec(), Vec::new(), true);
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        terminal.try_keystroke(gkey::Key::ArrowLeft, gkey::Mods::empty(), None, None);
+
+        assert_eq!(take(&captured), b"\x1b[D");
+    }
+
+    #[test]
+    fn cold_restore_places_live_output_after_restored_scrollback() {
+        let mut terminal = attached_terminal();
+        let msg = attached_msg(
+            b"\x1b[24;1HRESTORED-CONTENT\x1b[1;1H".to_vec(),
+            Vec::new(),
+            true,
+        );
+
+        TerminalView::replay_attached_state(&mut terminal, &msg);
+
+        assert_eq!(
+            terminal.last_content.cursor.row,
+            terminal.last_content.terminal_bounds.rows - 1
+        );
+
+        terminal.feed_pty_data(b"NEW-SHELL-LINE");
+        terminal.sync();
+
+        let text = terminal_text(&terminal);
+        assert!(text.contains("RESTORED-CONTENT"), "{text}");
+        assert!(text.contains("NEW-SHELL-LINE"), "{text}");
     }
 }
 
@@ -1879,17 +2176,15 @@ impl Render for TerminalView {
                 if !this.is_interactive() {
                     return;
                 }
-                if let Some((key, mods, utf8, unshifted)) =
-                    Self::map_keystroke(&event.keystroke)
-                {
+                if let Some(mapped) = Self::map_keystroke(&event.keystroke) {
                     this.show_cursor_now(cx);
-                    // Commit pending IME preedit
-                    if !this.ime_preedit.is_empty() {
-                        let text = std::mem::take(&mut this.ime_preedit);
-                        this.terminal.input(text.as_bytes());
+                    if Self::dispatch_mapped_keystroke(
+                        &mut this.terminal,
+                        mapped,
+                        &mut this.ime_preedit,
+                    ) {
+                        cx.stop_propagation();
                     }
-                    this.terminal
-                        .try_keystroke(key, mods, utf8.as_deref(), unshifted);
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {

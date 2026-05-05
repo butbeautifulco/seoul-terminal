@@ -43,7 +43,6 @@ const RIGHT_SIDEBAR_MAX: f32 = 600.0;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestorePlanMode {
     Attach,
-    Ensure,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -92,33 +91,12 @@ fn plan_restore_order(
         .unwrap_or(0);
 
     let active = candidates[active_attach_idx].clone();
-    let mut entries = vec![RestorePlanEntry {
+    vec![RestorePlanEntry {
         tab_id: active.tab_id,
         session_id: active.session_id,
         workspace_id: active.workspace_id,
         mode: RestorePlanMode::Attach,
-    }];
-
-    entries.extend(
-        candidates
-            .into_iter()
-            .enumerate()
-            .filter(|(idx, _)| *idx != active_attach_idx)
-            .map(|(_, candidate)| RestorePlanEntry {
-                tab_id: candidate.tab_id,
-                session_id: candidate.session_id,
-                workspace_id: candidate.workspace_id,
-                mode: RestorePlanMode::Ensure,
-            }),
-    );
-
-    entries.sort_by_key(|entry| {
-        (
-            entry.mode != RestorePlanMode::Attach,
-            active_workspace_id != Some(entry.workspace_id),
-        )
-    });
-    entries
+    }]
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -216,8 +194,6 @@ pub struct AppView {
     pending_reattach_handles: Vec<(Uuid, DaemonSessionHandle)>,
     /// Terminal tabs with an in-flight full attach request.
     pending_attach_tabs: HashSet<Uuid>,
-    /// Sessions with an in-flight background ensure request.
-    pending_ensure_sessions: HashSet<Uuid>,
     /// All terminal tab entities keyed by tab ID.
     terminal_tabs: HashMap<Uuid, Entity<TerminalView>>,
     /// Whether daemon is currently connected (drives disconnect overlay + input blocking)
@@ -331,7 +307,6 @@ impl AppView {
             new_ws_prompt: None,
             pending_reattach_handles: Vec::new(),
             pending_attach_tabs: HashSet::new(),
-            pending_ensure_sessions: HashSet::new(),
             terminal_tabs: HashMap::new(),
             daemon_connected: has_daemon,
             pending_recoveries: 0,
@@ -644,8 +619,9 @@ impl AppView {
         });
 
         // Collect tabs that need daemon work. Only the active terminal gets a
-        // full attach; hidden tabs are only ensured so they do not replay
-        // scrollback on the UI thread during startup.
+        // full attach during startup. Hidden restored tabs stay pending until
+        // activation so cold restore scrollback is delivered to the first view
+        // that actually renders the session.
         let mut candidates = Vec::new();
         let mut cwd_by_workspace = HashMap::new();
         let active_workspace = self.active_workspace_id();
@@ -689,14 +665,7 @@ impl AppView {
         }
         self.pending_recoveries = restore_plan.len();
         for entry in &restore_plan {
-            match entry.mode {
-                RestorePlanMode::Attach => {
-                    self.pending_attach_tabs.insert(entry.tab_id);
-                }
-                RestorePlanMode::Ensure => {
-                    self.pending_ensure_sessions.insert(entry.session_id);
-                }
-            }
+            self.pending_attach_tabs.insert(entry.tab_id);
         }
 
         if restore_trace_enabled() {
@@ -708,7 +677,7 @@ impl AppView {
         }
 
         // Spawn one background task. Work remains serial so the daemon is not
-        // flooded, but only the first entry is a full attach.
+        // flooded if this plan expands in the future.
         cx.spawn(async move |this: WeakEntity<Self>, cx: &mut AsyncApp| {
             for entry in restore_plan {
                 let inner = inner.clone();
@@ -721,33 +690,20 @@ impl AppView {
                 let result = cx
                     .background_executor()
                     .spawn(async move {
-                        match request_entry.mode {
-                            RestorePlanMode::Attach => {
-                                DaemonClientInner::create_or_attach(
-                                    &inner,
-                                    request_entry.session_id,
-                                    request_entry.workspace_id,
-                                    80,
-                                    24,
-                                    cwd,
-                                )
-                                .map(|handle| (request_entry, Some(handle)))
-                            }
-                            RestorePlanMode::Ensure => DaemonClientInner::ensure_session(
-                                &inner,
-                                request_entry.session_id,
-                                request_entry.workspace_id,
-                                80,
-                                24,
-                                cwd,
-                            )
-                            .map(|_| (request_entry, None)),
-                        }
+                        DaemonClientInner::create_or_attach(
+                            &inner,
+                            request_entry.session_id,
+                            request_entry.workspace_id,
+                            80,
+                            24,
+                            cwd,
+                        )
+                        .map(|handle| (request_entry, handle))
                     })
                     .await;
 
                 match result {
-                    Ok((entry, Some(session_handle))) => {
+                    Ok((entry, session_handle)) => {
                         let _ = this.update(cx, |app, cx| {
                             if restore_trace_enabled() {
                                 tracing::info!(
@@ -763,39 +719,10 @@ impl AppView {
                             cx.notify();
                         });
                     }
-                    Ok((entry, None)) => {
-                        let _ = this.update(cx, |app, cx| {
-                            if restore_trace_enabled() {
-                                tracing::info!(
-                                    tab_id = %entry.tab_id,
-                                    session_id = %entry.session_id,
-                                    elapsed_ms = started_at.elapsed().as_millis(),
-                                    "restore trace: background ensure complete"
-                                );
-                            }
-                            app.pending_ensure_sessions.remove(&entry.session_id);
-                            app.pending_recoveries = app.pending_recoveries.saturating_sub(1);
-                            cx.notify();
-                        });
-                    }
                     Err(e) => {
                         let _ = this.update(cx, |app, cx| {
-                            match entry.mode {
-                                RestorePlanMode::Attach => {
-                                    app.pending_attach_tabs.remove(&entry.tab_id);
-                                    tracing::warn!(
-                                        "background attach failed for {}: {e}",
-                                        entry.session_id
-                                    );
-                                }
-                                RestorePlanMode::Ensure => {
-                                    app.pending_ensure_sessions.remove(&entry.session_id);
-                                    tracing::warn!(
-                                        "background ensure failed for {}: {e}",
-                                        entry.session_id
-                                    );
-                                }
-                            }
+                            app.pending_attach_tabs.remove(&entry.tab_id);
+                            tracing::warn!("background attach failed for {}: {e}", entry.session_id);
                             app.pending_recoveries = app.pending_recoveries.saturating_sub(1);
                             cx.notify();
                         });
@@ -928,7 +855,6 @@ impl AppView {
     fn mark_daemon_terminals_pending(&mut self, cx: &mut Context<Self>) {
         self.pending_reattach_handles.clear();
         self.pending_attach_tabs.clear();
-        self.pending_ensure_sessions.clear();
         self.pending_recoveries = 0;
         for tab_id in self.tab_sessions.keys() {
             let Some(terminal) = self.terminal_tabs.get(tab_id).cloned() else {
@@ -1431,7 +1357,6 @@ impl AppView {
                     self.terminal_tabs.remove(tab_id);
                     self.pending_attach_tabs.remove(tab_id);
                     if let Some(session_id) = self.tab_sessions.remove(tab_id) {
-                        self.pending_ensure_sessions.remove(&session_id);
                         if let Some(client) = &self.daemon_client {
                             client.kill(session_id).ok();
                         }
@@ -3269,7 +3194,7 @@ mod restore_tests {
     use uuid::Uuid;
 
     #[test]
-    fn restore_plan_attaches_active_tab_first_and_ensures_hidden_tabs() {
+    fn restore_plan_attaches_only_active_tab_and_leaves_hidden_tabs_pending() {
         let active_ws = Uuid::new_v4();
         let other_ws = Uuid::new_v4();
         let active_tab = Uuid::new_v4();
@@ -3305,26 +3230,12 @@ mod restore_tests {
 
         assert_eq!(
             entries,
-            vec![
-                RestorePlanEntry {
-                    tab_id: active_tab,
-                    session_id: active_session,
-                    workspace_id: active_ws,
-                    mode: RestorePlanMode::Attach,
-                },
-                RestorePlanEntry {
-                    tab_id: hidden_active_ws_tab,
-                    session_id: hidden_session,
-                    workspace_id: active_ws,
-                    mode: RestorePlanMode::Ensure,
-                },
-                RestorePlanEntry {
-                    tab_id: other_tab,
-                    session_id: other_session,
-                    workspace_id: other_ws,
-                    mode: RestorePlanMode::Ensure,
-                },
-            ]
+            vec![RestorePlanEntry {
+                tab_id: active_tab,
+                session_id: active_session,
+                workspace_id: active_ws,
+                mode: RestorePlanMode::Attach,
+            }]
         );
     }
 
@@ -3354,10 +3265,15 @@ mod restore_tests {
             Some(workspace_id),
         );
 
-        assert_eq!(entries[0].tab_id, first_tab);
-        assert_eq!(entries[0].mode, RestorePlanMode::Attach);
-        assert_eq!(entries[1].tab_id, second_tab);
-        assert_eq!(entries[1].mode, RestorePlanMode::Ensure);
+        assert_eq!(
+            entries,
+            vec![RestorePlanEntry {
+                tab_id: first_tab,
+                session_id: first_session,
+                workspace_id,
+                mode: RestorePlanMode::Attach,
+            }]
+        );
     }
 
     #[test]

@@ -1,13 +1,13 @@
 //! Lightweight terminal mode tracker.
 //!
 //! Parses PTY output for DECSET/DECRST (`ESC[?...h`/`ESC[?...l`) mode changes
-//! and OSC-7 (`ESC]7;file://...BEL`) CWD updates. Tracks 20 terminal modes
+//! and OSC-7 (`ESC]7;file://...BEL`) CWD updates. Tracks terminal modes
 //! that affect input behavior and can generate rehydration escape sequences
 //! to restore modes on warm attach.
 
 const MAX_ESC_BUFFER_SIZE: usize = 1024;
 
-/// The 20 terminal modes we track for rehydration.
+/// The terminal modes we track for rehydration.
 #[derive(Debug, Clone)]
 pub struct TerminalModes {
     pub application_cursor_keys: bool, // DECSET 1
@@ -22,14 +22,17 @@ pub struct TerminalModes {
     pub focus_reporting: bool,         // DECSET 1004
     pub mouse_utf8: bool,              // DECSET 1005
     pub mouse_sgr: bool,               // DECSET 1006
+    pub alt_scroll: bool,              // DECSET 1007 (default: true)
     pub mouse_urxvt: bool,             // DECSET 1015
     pub mouse_sgr_pixels: bool,        // DECSET 1016
     pub alternate_screen: bool,        // DECSET 47/1049
     pub bracketed_paste: bool,         // DECSET 2004
-    pub synchronized_output: bool,      // DECSET 2026
-    pub grapheme_cluster: bool,         // DECSET 2027
-    pub color_scheme_report: bool,      // DECSET 2031
-    pub in_band_resize_reports: bool,   // DECSET 2048
+    pub synchronized_output: bool,     // DECSET 2026
+    pub grapheme_cluster: bool,        // DECSET 2027
+    pub color_scheme_report: bool,     // DECSET 2031
+    pub in_band_resize_reports: bool,  // DECSET 2048
+    pub modify_other_keys: bool,       // CSI > 4 ; 2 m
+    pub kitty_keyboard_flags: u8,      // CSI = flags ; mode u / CSI > flags u
 }
 
 impl Default for TerminalModes {
@@ -47,6 +50,7 @@ impl Default for TerminalModes {
             focus_reporting: false,
             mouse_utf8: false,
             mouse_sgr: false,
+            alt_scroll: true,
             mouse_urxvt: false,
             mouse_sgr_pixels: false,
             alternate_screen: false,
@@ -55,6 +59,8 @@ impl Default for TerminalModes {
             grapheme_cluster: false,
             color_scheme_report: false,
             in_band_resize_reports: false,
+            modify_other_keys: false,
+            kitty_keyboard_flags: 0,
         }
     }
 }
@@ -62,10 +68,12 @@ impl Default for TerminalModes {
 #[derive(Debug, Clone, Copy, PartialEq)]
 enum ParseState {
     Normal,
-    Escape,       // saw ESC
-    Csi,          // saw ESC[
-    CsiQuestion,  // saw ESC[?
-    CsiDigits,    // saw ESC[?<digits> (accumulating mode numbers)
+    Escape,      // saw ESC
+    Csi,         // saw ESC[
+    CsiQuestion, // saw ESC[?
+    CsiDigits,   // saw ESC[?<digits> (accumulating mode numbers)
+    CsiPrefixed, // saw ESC[>, ESC[=, or ESC[<
+    CsiPrefixedDigits,
     Osc,          // saw ESC]
     OscDigit,     // saw ESC]<digit> (accumulating OSC number)
     OscSemicolon, // saw ESC]7; (reading OSC-7 content)
@@ -79,6 +87,11 @@ pub struct ModeTracker {
     digit_buf: Vec<u8>,
     /// Buffer for OSC-7 content (the URI).
     osc_content: Vec<u8>,
+    /// CSI private prefix currently being parsed ('>', '=', or '<').
+    csi_prefix: u8,
+    /// Stack for Kitty keyboard protocol push/pop state.
+    kitty_keyboard_stack: [u8; 8],
+    kitty_keyboard_stack_len: usize,
     /// OSC number being parsed.
     osc_number: u16,
     /// Tracks buffer length to prevent unbounded growth.
@@ -93,6 +106,9 @@ impl ModeTracker {
             state: ParseState::Normal,
             digit_buf: Vec::new(),
             osc_content: Vec::new(),
+            csi_prefix: 0,
+            kitty_keyboard_stack: [0; 8],
+            kitty_keyboard_stack_len: 0,
             osc_number: 0,
             seq_len: 0,
         }
@@ -135,6 +151,10 @@ impl ModeTracker {
                     if byte == b'?' {
                         self.state = ParseState::CsiQuestion;
                         self.digit_buf.clear();
+                    } else if matches!(byte, b'>' | b'=' | b'<') {
+                        self.state = ParseState::CsiPrefixed;
+                        self.csi_prefix = byte;
+                        self.digit_buf.clear();
                     } else {
                         self.reset_state();
                     }
@@ -158,6 +178,28 @@ impl ModeTracker {
                     } else if byte == b'h' || byte == b'l' {
                         let enabled = byte == b'h';
                         self.apply_modes(enabled);
+                        self.reset_state();
+                    } else {
+                        self.reset_state();
+                    }
+                }
+                ParseState::CsiPrefixed => {
+                    if byte.is_ascii_digit() {
+                        self.state = ParseState::CsiPrefixedDigits;
+                        self.digit_buf.clear();
+                        self.digit_buf.push(byte);
+                    } else if matches!(byte, b'm' | b'n' | b'u') {
+                        self.apply_prefixed_csi(byte);
+                        self.reset_state();
+                    } else {
+                        self.reset_state();
+                    }
+                }
+                ParseState::CsiPrefixedDigits => {
+                    if byte.is_ascii_digit() || byte == b';' {
+                        self.digit_buf.push(byte);
+                    } else if matches!(byte, b'm' | b'n' | b'u') {
+                        self.apply_prefixed_csi(byte);
                         self.reset_state();
                     } else {
                         self.reset_state();
@@ -228,6 +270,7 @@ impl ModeTracker {
         emit(1004, m.focus_reporting, d.focus_reporting);
         emit(1005, m.mouse_utf8, d.mouse_utf8);
         emit(1006, m.mouse_sgr, d.mouse_sgr);
+        emit(1007, m.alt_scroll, d.alt_scroll);
         emit(1015, m.mouse_urxvt, d.mouse_urxvt);
         emit(1016, m.mouse_sgr_pixels, d.mouse_sgr_pixels);
         emit(1049, m.alternate_screen, d.alternate_screen);
@@ -236,6 +279,15 @@ impl ModeTracker {
         emit(2027, m.grapheme_cluster, d.grapheme_cluster);
         emit(2031, m.color_scheme_report, d.color_scheme_report);
         emit(2048, m.in_band_resize_reports, d.in_band_resize_reports);
+
+        if m.modify_other_keys {
+            seq.extend_from_slice(b"\x1b[>4;2m");
+        }
+        if m.kitty_keyboard_flags != d.kitty_keyboard_flags {
+            seq.extend_from_slice(b"\x1b[=");
+            seq.extend_from_slice(m.kitty_keyboard_flags.to_string().as_bytes());
+            seq.extend_from_slice(b";1u");
+        }
 
         seq
     }
@@ -257,24 +309,128 @@ impl ModeTracker {
             1 => self.modes.application_cursor_keys = enabled,
             6 => self.modes.origin_mode = enabled,
             7 => self.modes.auto_wrap = enabled,
-            9 => self.modes.mouse_x10 = enabled,
+            9 => self.set_mouse_event_mode(Some(MouseEventMode::X10), enabled),
             25 => self.modes.cursor_visible = enabled,
             47 | 1047 | 1049 => self.modes.alternate_screen = enabled,
-            1000 => self.modes.mouse_normal = enabled,
-            1001 => self.modes.mouse_highlight = enabled,
-            1002 => self.modes.mouse_button_event = enabled,
-            1003 => self.modes.mouse_any_event = enabled,
+            1000 => self.set_mouse_event_mode(Some(MouseEventMode::Normal), enabled),
+            1001 => self.set_mouse_event_mode(Some(MouseEventMode::Highlight), enabled),
+            1002 => self.set_mouse_event_mode(Some(MouseEventMode::Button), enabled),
+            1003 => self.set_mouse_event_mode(Some(MouseEventMode::Any), enabled),
             1004 => self.modes.focus_reporting = enabled,
-            1005 => self.modes.mouse_utf8 = enabled,
-            1006 => self.modes.mouse_sgr = enabled,
-            1015 => self.modes.mouse_urxvt = enabled,
-            1016 => self.modes.mouse_sgr_pixels = enabled,
+            1005 => self.set_mouse_format_mode(Some(MouseFormatMode::Utf8), enabled),
+            1006 => self.set_mouse_format_mode(Some(MouseFormatMode::Sgr), enabled),
+            1007 => self.modes.alt_scroll = enabled,
+            1015 => self.set_mouse_format_mode(Some(MouseFormatMode::Urxvt), enabled),
+            1016 => self.set_mouse_format_mode(Some(MouseFormatMode::SgrPixels), enabled),
             2004 => self.modes.bracketed_paste = enabled,
             2026 => self.modes.synchronized_output = enabled,
             2027 => self.modes.grapheme_cluster = enabled,
             2031 => self.modes.color_scheme_report = enabled,
             2048 => self.modes.in_band_resize_reports = enabled,
             _ => {} // Untracked mode
+        }
+    }
+
+    fn set_mouse_event_mode(&mut self, mode: Option<MouseEventMode>, enabled: bool) {
+        self.modes.mouse_x10 = false;
+        self.modes.mouse_normal = false;
+        self.modes.mouse_highlight = false;
+        self.modes.mouse_button_event = false;
+        self.modes.mouse_any_event = false;
+
+        if !enabled {
+            return;
+        }
+
+        match mode {
+            Some(MouseEventMode::X10) => self.modes.mouse_x10 = true,
+            Some(MouseEventMode::Normal) => self.modes.mouse_normal = true,
+            Some(MouseEventMode::Highlight) => self.modes.mouse_highlight = true,
+            Some(MouseEventMode::Button) => self.modes.mouse_button_event = true,
+            Some(MouseEventMode::Any) => self.modes.mouse_any_event = true,
+            None => {}
+        }
+    }
+
+    fn set_mouse_format_mode(&mut self, mode: Option<MouseFormatMode>, enabled: bool) {
+        self.modes.mouse_utf8 = false;
+        self.modes.mouse_sgr = false;
+        self.modes.mouse_urxvt = false;
+        self.modes.mouse_sgr_pixels = false;
+
+        if !enabled {
+            return;
+        }
+
+        match mode {
+            Some(MouseFormatMode::Utf8) => self.modes.mouse_utf8 = true,
+            Some(MouseFormatMode::Sgr) => self.modes.mouse_sgr = true,
+            Some(MouseFormatMode::Urxvt) => self.modes.mouse_urxvt = true,
+            Some(MouseFormatMode::SgrPixels) => self.modes.mouse_sgr_pixels = true,
+            None => {}
+        }
+    }
+
+    fn apply_prefixed_csi(&mut self, final_byte: u8) {
+        let params = parse_params(&self.digit_buf);
+        match (self.csi_prefix, final_byte) {
+            (b'>', b'u') => {
+                let flags = params.first().copied().unwrap_or(0).min(31) as u8;
+                self.push_kitty_keyboard(flags);
+            }
+            (b'=', b'u') => {
+                let flags = params.first().copied().unwrap_or(0).min(31) as u8;
+                let mode = params.get(1).copied().unwrap_or(1);
+                match mode {
+                    1 => self.modes.kitty_keyboard_flags = flags,
+                    2 => self.modes.kitty_keyboard_flags |= flags,
+                    3 => self.modes.kitty_keyboard_flags &= !flags,
+                    _ => {}
+                }
+            }
+            (b'<', b'u') => {
+                let count = params.first().copied().unwrap_or(1) as usize;
+                self.pop_kitty_keyboard(count);
+            }
+            (b'>', b'm') => {
+                self.modes.modify_other_keys =
+                    params.first().copied() == Some(4) && params.get(1).copied() == Some(2);
+            }
+            (b'>', b'n') => {
+                self.modes.modify_other_keys = false;
+            }
+            _ => {}
+        }
+    }
+
+    fn push_kitty_keyboard(&mut self, flags: u8) {
+        if self.kitty_keyboard_stack_len < self.kitty_keyboard_stack.len() {
+            self.kitty_keyboard_stack[self.kitty_keyboard_stack_len] =
+                self.modes.kitty_keyboard_flags;
+            self.kitty_keyboard_stack_len += 1;
+        }
+        self.modes.kitty_keyboard_flags = flags;
+    }
+
+    fn pop_kitty_keyboard(&mut self, count: usize) {
+        if count == 0 {
+            return;
+        }
+
+        if count >= self.kitty_keyboard_stack.len() {
+            self.kitty_keyboard_stack_len = 0;
+            self.modes.kitty_keyboard_flags = 0;
+            return;
+        }
+
+        for _ in 0..count {
+            if self.kitty_keyboard_stack_len == 0 {
+                self.modes.kitty_keyboard_flags = 0;
+                return;
+            }
+            self.kitty_keyboard_stack_len -= 1;
+            self.modes.kitty_keyboard_flags =
+                self.kitty_keyboard_stack[self.kitty_keyboard_stack_len];
         }
     }
 
@@ -291,8 +447,26 @@ impl ModeTracker {
 
     fn reset_state(&mut self) {
         self.state = ParseState::Normal;
+        self.csi_prefix = 0;
         self.seq_len = 0;
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MouseEventMode {
+    X10,
+    Normal,
+    Highlight,
+    Button,
+    Any,
+}
+
+#[derive(Debug, Clone, Copy)]
+enum MouseFormatMode {
+    Utf8,
+    Sgr,
+    Urxvt,
+    SgrPixels,
 }
 
 /// Extract the path from an OSC-7 file URI.
@@ -346,6 +520,17 @@ fn parse_u16(digits: &[u8]) -> u16 {
         }
     }
     n
+}
+
+fn parse_params(params: &[u8]) -> Vec<u16> {
+    if params.is_empty() {
+        return Vec::new();
+    }
+
+    params
+        .split(|&b| b == b';')
+        .map(parse_u16)
+        .collect::<Vec<_>>()
 }
 
 #[cfg(test)]
@@ -414,7 +599,7 @@ mod tests {
         let mut t = ModeTracker::new();
         t.process(b"\x1b[?1015;1016;2026;2027;2031;2048h");
 
-        assert!(t.modes().mouse_urxvt);
+        assert!(!t.modes().mouse_urxvt);
         assert!(t.modes().mouse_sgr_pixels);
         assert!(t.modes().synchronized_output);
         assert!(t.modes().grapheme_cluster);
@@ -423,7 +608,7 @@ mod tests {
 
         let seq = t.generate_rehydrate_sequences();
         let s = String::from_utf8(seq).unwrap();
-        assert!(s.contains("\x1b[?1015h"));
+        assert!(!s.contains("\x1b[?1015h"));
         assert!(s.contains("\x1b[?1016h"));
         assert!(s.contains("\x1b[?2026h"));
         assert!(s.contains("\x1b[?2027h"));
@@ -433,6 +618,48 @@ mod tests {
         t.process(b"\x1b[?2026;2048l");
         assert!(!t.modes().synchronized_output);
         assert!(!t.modes().in_band_resize_reports);
+    }
+
+    #[test]
+    fn rehydrate_includes_disabled_alternate_scroll_mode() {
+        let mut t = ModeTracker::new();
+        assert!(t.modes().alt_scroll);
+        t.process(b"\x1b[?1007l");
+        assert!(!t.modes().alt_scroll);
+
+        let seq = t.generate_rehydrate_sequences();
+        let s = String::from_utf8(seq).unwrap();
+        assert!(s.contains("\x1b[?1007l"));
+
+        t.process(b"\x1b[?1007h");
+        assert!(t.modes().alt_scroll);
+        let seq = t.generate_rehydrate_sequences();
+        let s = String::from_utf8(seq).unwrap();
+        assert!(!s.contains("\x1b[?1007"));
+    }
+
+    #[test]
+    fn rehydrate_mouse_modes_use_effective_event_and_format() {
+        let mut t = ModeTracker::new();
+        t.process(b"\x1b[?1000h\x1b[?1002h\x1b[?1003h\x1b[?1006h");
+
+        let seq = t.generate_rehydrate_sequences();
+        let s = String::from_utf8(seq).unwrap();
+        assert!(s.contains("\x1b[?1003h"));
+        assert!(s.contains("\x1b[?1006h"));
+        assert!(!s.contains("\x1b[?1000h"));
+        assert!(!s.contains("\x1b[?1002h"));
+    }
+
+    #[test]
+    fn rehydrate_includes_keyboard_input_protocol_modes() {
+        let mut t = ModeTracker::new();
+        t.process(b"\x1b[>3u\x1b[>4;2m");
+
+        let seq = t.generate_rehydrate_sequences();
+        let s = String::from_utf8(seq).unwrap();
+        assert!(s.contains("\x1b[=3;1u"));
+        assert!(s.contains("\x1b[>4;2m"));
     }
 
     #[test]
