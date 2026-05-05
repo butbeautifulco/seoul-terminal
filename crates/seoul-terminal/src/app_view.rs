@@ -24,6 +24,7 @@ use crate::resource_indicator::ResourceIndicator;
 use crate::settings_view::{SettingsEvent, SettingsView};
 use crate::terminal_view::TerminalView;
 use crate::theme;
+use crate::titlebar::TitleBar;
 use crate::toast::{ToastKind, ToastManager};
 use seoul_workspace::settings::SettingsStore;
 use std::sync::Arc;
@@ -226,6 +227,9 @@ pub struct AppView {
     /// Index of the PR event poll task within `_tasks`,
     /// replaced when the daemon reconnects (dropping the prior task).
     pr_event_task_idx: Option<usize>,
+    /// Custom window titlebar entity. Constructed lazily on first render so it
+    /// can capture a strong handle to `Self`'s entity.
+    titlebar: Option<Entity<TitleBar>>,
 }
 
 struct NewWorkspacePrompt {
@@ -318,6 +322,7 @@ impl AppView {
             git_subscription_idx: None,
             git_panel_subscription_idx: None,
             pr_event_task_idx: None,
+            titlebar: None,
         };
 
         // If daemon client was already provided, still restore the layout as
@@ -1276,6 +1281,45 @@ impl AppView {
 
     fn active_workspace_id(&self) -> Option<Uuid> {
         self.state.active_workspace_id
+    }
+
+    /// Title-bar accessor: human-readable name of the active workspace.
+    pub(crate) fn active_workspace_name(&self) -> Option<SharedString> {
+        self.state
+            .active_workspace()
+            .map(|ws| SharedString::from(ws.name.clone()))
+    }
+
+    /// Title-bar accessor: branch label with HEAD/detached fallback to the
+    /// workspace's persisted branch — the same logic the status bar uses.
+    pub(crate) fn active_branch_label(&self, cx: &App) -> Option<SharedString> {
+        let provider = self.git_provider.as_ref()?;
+        let status = provider.read(cx).status();
+        let branch = if status.branch == "HEAD" || status.branch == "(detached)" {
+            self.state
+                .active_workspace()
+                .map(|ws| ws.branch.clone())
+                .unwrap_or_else(|| status.branch.clone())
+        } else {
+            status.branch.clone()
+        };
+        Some(SharedString::from(branch))
+    }
+
+    /// Title-bar accessor: (ahead, behind) commit counts vs. tracked branch.
+    pub(crate) fn active_ahead_behind(&self, cx: &App) -> (u32, u32) {
+        match self.git_provider.as_ref() {
+            Some(provider) => {
+                let s = provider.read(cx).status();
+                (s.ahead, s.behind)
+            }
+            None => (0, 0),
+        }
+    }
+
+    /// Title-bar accessor: whether the daemon socket is currently up.
+    pub(crate) fn is_daemon_connected(&self) -> bool {
+        self.daemon_connected
     }
 
     fn active_pane_entity(&self) -> Option<Entity<Pane>> {
@@ -3206,10 +3250,23 @@ impl Focusable for AppView {
     }
 }
 
+impl AppView {
+    /// Lazily construct the custom titlebar on the first render. Done lazily
+    /// because the titlebar wants a strong handle to `Self`, which we only
+    /// have inside `Render::render` via `cx.entity()`.
+    fn ensure_titlebar(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        if self.titlebar.is_none() {
+            let app_view = cx.entity();
+            self.titlebar = Some(cx.new(|cx| TitleBar::new(app_view, window, cx)));
+        }
+    }
+}
+
 impl Render for AppView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Process completed background reattachments (non-blocking: just creates TerminalView entities)
-        self.process_pending_reattach_handles(_window, cx);
+        self.process_pending_reattach_handles(window, cx);
+        self.ensure_titlebar(window, cx);
 
         let t = theme::theme(cx);
         let sidebar = self.render_sidebar(cx);
@@ -3227,12 +3284,12 @@ impl Render for AppView {
             })
         });
 
-        div()
-            .id("app-root")
-            .key_context("app")
-            .track_focus(&self.focus_handle)
-            .size_full()
-            .relative()
+        // The body keeps its own action/drag handlers; lifting them onto the
+        // outer `v_flex` would compete with the chrome's drag/double-click.
+        let body = div()
+            .id("app-body")
+            .flex_1()
+            .min_h_0()
             .flex()
             .flex_row()
             .bg(rgb(t.base))
@@ -3262,7 +3319,17 @@ impl Render for AppView {
             )
             .child(right_sidebar)
             .child(self.toast.clone())
-            .children(resource_overlay)
+            .children(resource_overlay);
+
+        div()
+            .id("app-root")
+            .key_context("app")
+            .track_focus(&self.focus_handle)
+            .size_full()
+            .flex()
+            .flex_col()
+            .children(self.titlebar.clone().map(IntoElement::into_any_element))
+            .child(body)
     }
 }
 

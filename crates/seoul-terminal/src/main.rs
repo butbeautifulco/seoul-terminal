@@ -23,6 +23,7 @@ mod terminal_render_cache;
 mod terminal_view;
 mod text_input;
 mod theme;
+mod titlebar;
 mod toast;
 mod undo_history;
 
@@ -137,8 +138,14 @@ fn open_app_window(cx: &mut App) {
                 cx,
             ))),
             titlebar: Some(TitlebarOptions {
-                title: Some("Seoul".into()),
-                ..Default::default()
+                // Title is set dynamically by the custom titlebar via
+                // `window.set_window_title`. Leaving it `None` here avoids
+                // a duplicated string when AppView hasn't yet computed one.
+                title: None,
+                // `traffic_light_position` is honored only when the titlebar
+                // appears transparent — keep these two in sync.
+                appears_transparent: true,
+                traffic_light_position: Some(point(px(9.0), px(9.0))),
             }),
             ..Default::default()
         },
