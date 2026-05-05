@@ -19,8 +19,10 @@ Workspace crates:
 - `just app` — launch `target/debug/seoul`. **Required** because it sets `DYLD_LIBRARY_PATH` to the built `libghostty-vt` directory; running `cargo run` or the binary directly will fail to load the dylib on macOS.
 - `just kill-daemon` — manual daemon kill + runtime file cleanup. Only needed when `just dev` is **not** running (e.g., daemon wedged, or you built once with `just build`). `just dev` already handles this on every rebuild.
 - `just clean-runtime` — remove `~/.seoul/terminal-host.{sock,pid,token}` without killing.
-- `just test` → `cargo test --workspace`
-- `just lint` → `cargo clippy --workspace -- -D warnings`
+- `just test` → `cargo test --workspace --locked`
+- `just lint` → `cargo clippy --workspace --all-targets --locked -- -D warnings`
+
+Rust is pinned in `rust-toolchain.toml` and CI installs that pinned toolchain, not floating `stable`. Keep the file pinned so local and CI Clippy use the same lint set. Zig is pinned in `.zigversion`; CI installs that version for `libghostty-vt`.
 
 ## Lint rules (workspace-wide, hard errors)
 
@@ -32,6 +34,6 @@ When editing `seoul-daemon` or `seoul-terminal-proto`, the running daemon must b
 
 ## Working with coding agents
 
-- **Verify before claiming done.** Run `just lint && just test` before committing or saying work is finished. `just lint` is the real gate, not `cargo check` — the workspace denies `dbg_macro`/`todo`/`redundant_clone` so clippy catches things `check` doesn't.
+- **Verify before claiming done.** Run `just lint && just test` before committing or saying work is finished. `just lint` mirrors the CI clippy command and is the real gate, not `cargo check` — the workspace denies `dbg_macro`/`todo`/`redundant_clone` so clippy catches things `check` doesn't.
 - **Plan before large changes.** For multi-file edits, refactors, or new subsystems, outline the approach before touching code.
 - **Explain tradeoffs when refactoring.** When multiple valid approaches exist, surface what's being traded off (perf vs. clarity, flexibility vs. simplicity, etc.) rather than silently picking one.

@@ -305,7 +305,9 @@ impl ResourceIndicator {
                     .partial_cmp(&a.cpu_percent)
                     .unwrap_or(std::cmp::Ordering::Equal)
             }),
-            SortMode::Memory => sessions.sort_by(|a, b| b.memory_bytes.cmp(&a.memory_bytes)),
+            SortMode::Memory => {
+                sessions.sort_by_key(|session| std::cmp::Reverse(session.memory_bytes));
+            }
             SortMode::Name => sessions.sort_by(|a, b| {
                 let a_name = a.foreground_process.as_deref().unwrap_or("shell");
                 let b_name = b.foreground_process.as_deref().unwrap_or("shell");

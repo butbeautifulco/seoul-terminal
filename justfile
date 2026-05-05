@@ -26,7 +26,7 @@ package-macos:
 
 # Run all tests
 test:
-    cargo test --workspace
+    cargo test --workspace --locked
 
 # Lint
 lint:

@@ -8,7 +8,7 @@ Early development. Apple Silicon only for now. Expect rough edges and breaking c
 
 ## Building
 
-You will need a recent Rust toolchain (the workspace pins a `rust-toolchain.toml`) and [`just`](https://github.com/casey/just). For the watch loop, install `watchexec`:
+You will need the Rust toolchain pinned in `rust-toolchain.toml`, the Zig version pinned in `.zigversion` on `PATH` for `libghostty-vt`, and [`just`](https://github.com/casey/just). For the watch loop, install `watchexec`:
 
 ```
 cargo install watchexec-cli
@@ -24,11 +24,11 @@ just app   # launch the desktop app (sets DYLD_LIBRARY_PATH for libghostty-vt)
 `just app` is required on macOS because running the binary directly will fail to load the bundled `libghostty-vt` dylib. If you ever build without `just dev` running, use `just kill-daemon` before relaunching so a stale daemon does not serve the new app.
 
 ```
-just test   # cargo test --workspace
-just lint   # cargo clippy --workspace -- -D warnings
+just test   # cargo test --workspace --locked
+just lint   # cargo clippy --workspace --all-targets --locked -- -D warnings
 ```
 
-`dbg!`, `todo!`, and `redundant_clone` are denied at the workspace level, so `just lint` is the real gate.
+`dbg!`, `todo!`, and `redundant_clone` are denied at the workspace level, so `just lint` is the real gate. CI installs Rust from `rust-toolchain.toml`; keep that file pinned so local Clippy and CI Clippy stay on the same lint set.
 
 ## Workspace layout
 
