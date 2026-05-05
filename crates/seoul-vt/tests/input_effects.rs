@@ -3,6 +3,7 @@ use std::sync::{Arc, Mutex};
 
 use libghostty_vt::{key, mouse};
 use seoul_vt::config::TerminalConfig;
+use seoul_vt::selection::TerminalGridPoint;
 use seoul_vt::terminal::TerminalBounds;
 use seoul_vt::{Terminal, TerminalBuilder};
 
@@ -91,6 +92,24 @@ fn title_bell_queries_and_size_effects_work() {
     .unwrap();
     term.feed_pty_data(b"\x1b[18t");
     assert_eq!(take(&captured), b"\x1b[8;24;80t");
+}
+
+#[test]
+fn osc8_link_text_uses_hidden_uri() {
+    let (mut term, _captured) = terminal();
+
+    term.feed_pty_data(b"\x1b]8;;https://example.com/docs\x07Docs\x1b]8;;\x07");
+    term.sync();
+
+    let link = term
+        .last_content
+        .link_at(TerminalGridPoint::new(0, 0))
+        .expect("OSC 8 display text should be clickable");
+    assert_eq!(link.uri, "https://example.com/docs");
+    assert_eq!(link.range.start, TerminalGridPoint::new(0, 0));
+    assert_eq!(link.range.end, TerminalGridPoint::new(0, 4));
+    assert_eq!(term.last_content.cells[0][0].link_id, Some(link.id));
+    assert_eq!(term.last_content.cells[0][3].link_id, Some(link.id));
 }
 
 #[test]

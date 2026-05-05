@@ -17,6 +17,7 @@ pub struct CachedCellRun {
     #[allow(dead_code)]
     pub faint: bool,
     pub has_wide: bool,
+    pub link_id: Option<u64>,
 }
 
 #[derive(Default)]
@@ -76,6 +77,7 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
         strikethrough: bool,
         faint: bool,
         has_wide: bool,
+        link_id: Option<u64>,
     }
 
     let mut runs: Vec<PendingCellRun> = Vec::new();
@@ -108,6 +110,7 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
             && last.underline == cell.underline
             && last.strikethrough == cell.strikethrough
             && last.faint == cell.faint
+            && last.link_id == cell.link_id
         {
             append_cell_text(&mut last.text, cell);
             last.cols = last.cols.saturating_add(1);
@@ -128,6 +131,7 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
             strikethrough: cell.strikethrough,
             faint: cell.faint,
             has_wide: is_wide,
+            link_id: cell.link_id,
         });
     }
 
@@ -144,6 +148,7 @@ fn build_runs_for_row(row_cells: &[RenderedCell]) -> Vec<CachedCellRun> {
             strikethrough: run.strikethrough,
             faint: run.faint,
             has_wide: run.has_wide,
+            link_id: run.link_id,
         })
         .collect()
 }
@@ -188,6 +193,8 @@ mod tests {
             strikethrough: false,
             faint: false,
             wide,
+            hyperlink: false,
+            link_id: None,
         }
     }
 
@@ -353,6 +360,24 @@ mod tests {
         let rows: Vec<_> = cache.rows().collect();
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0][0].text.as_ref(), "x");
+    }
+
+    #[test]
+    fn adjacent_link_and_plain_cells_do_not_merge() {
+        let mut linked = cell(0, 0, 'a', CellWidthKind::Narrow);
+        linked.link_id = Some(1);
+        let plain = cell(0, 1, 'b', CellWidthKind::Narrow);
+        let content = content(vec![vec![linked, plain]], 1, vec![0]);
+
+        let mut cache = TerminalRenderCache::default();
+        cache.update(&content, &TerminalConfig::default());
+
+        let rows: Vec<_> = cache.rows().collect();
+        assert_eq!(rows[0].len(), 2);
+        assert_eq!(rows[0][0].text.as_ref(), "a");
+        assert_eq!(rows[0][0].link_id, Some(1));
+        assert_eq!(rows[0][1].text.as_ref(), "b");
+        assert_eq!(rows[0][1].link_id, None);
     }
 
     #[test]

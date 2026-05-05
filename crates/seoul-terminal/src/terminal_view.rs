@@ -12,12 +12,15 @@ use gpui::*;
 use libghostty_vt::terminal::ScrollViewport;
 use libghostty_vt::{key, key as gkey, mouse};
 use seoul_vt::config::TerminalConfig;
+use seoul_vt::selection::{
+    SelectionMode, TerminalGridPoint, TerminalSelection, selected_text_for_selection,
+};
 use seoul_vt::terminal::TerminalBounds;
-use seoul_vt::{Terminal, TerminalBuilder};
+use seoul_vt::{SelectionPhase, Terminal, TerminalBuilder};
 use seoul_workspace::settings::SettingsStore;
 
 use crate::daemon_client::{DaemonClient, DaemonClientWriter, DaemonSessionHandle};
-use crate::terminal_element::render_terminal;
+use crate::terminal_element::{TerminalRenderOptions, render_terminal};
 use crate::terminal_render_cache::TerminalRenderCache;
 
 actions!(terminal, [Paste, Copy]);
@@ -73,6 +76,10 @@ pub struct TerminalView {
     // Element bounds for resize (shared with paint callback via Rc, no Entity access)
     element_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
     mouse_buttons_pressed: MouseButtonsPressed,
+    terminal_selection: Option<TerminalSelection>,
+    terminal_selecting: bool,
+    pending_link_click: Option<PendingLinkClick>,
+    hovered_link_id: Option<u64>,
     // Daemon session info (None for local PTY mode)
     session_id: Option<seoul_terminal_proto::session::SessionId>,
     daemon_client_writer: Option<DaemonClientWriter>,
@@ -108,6 +115,14 @@ pub struct TerminalView {
     // spawned for daemon-attached sessions; local-PTY mode has no ACK
     // protocol. Drop = automatic cancel.
     resize_ack_drain_task: Option<gpui::Task<()>>,
+}
+
+#[derive(Debug, Clone)]
+struct PendingLinkClick {
+    link_id: u64,
+    uri: String,
+    start_point: TerminalGridPoint,
+    start_surface_position: (f32, f32),
 }
 
 #[derive(Clone, Copy, Default)]
@@ -356,6 +371,10 @@ impl TerminalView {
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
             mouse_buttons_pressed: MouseButtonsPressed::default(),
+            terminal_selection: None,
+            terminal_selecting: false,
+            pending_link_click: None,
+            hovered_link_id: None,
             session_id: None,
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Local { cwd }),
@@ -426,6 +445,10 @@ impl TerminalView {
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
             mouse_buttons_pressed: MouseButtonsPressed::default(),
+            terminal_selection: None,
+            terminal_selecting: false,
+            pending_link_click: None,
+            hovered_link_id: None,
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: None,
@@ -780,6 +803,10 @@ impl TerminalView {
             ime_preedit: String::new(),
             element_bounds: Rc::new(Cell::new(None)),
             mouse_buttons_pressed: MouseButtonsPressed::default(),
+            terminal_selection: None,
+            terminal_selecting: false,
+            pending_link_click: None,
+            hovered_link_id: None,
             session_id: Some(session_id),
             daemon_client_writer: None,
             bootstrap: Some(BootstrapState::Attached {
@@ -1271,13 +1298,181 @@ impl TerminalView {
         if let Some(item) = cx.read_from_clipboard()
             && let Some(text) = item.text()
         {
+            let cleared_selection = self.clear_terminal_selection();
             self.show_cursor_now(cx);
             self.terminal.paste(&text);
+            if cleared_selection {
+                cx.notify();
+            }
         }
     }
 
-    fn copy(&mut self, _: &Copy, _window: &mut Window, _cx: &mut Context<Self>) {
-        // TODO: implement text selection + copy
+    fn copy(&mut self, _: &Copy, _window: &mut Window, cx: &mut Context<Self>) {
+        let Some(selection) = &self.terminal_selection else {
+            return;
+        };
+        let text = selected_text_for_selection(&self.terminal.last_content, selection);
+        if !text.is_empty() {
+            cx.write_to_clipboard(ClipboardItem::new_string(text));
+        }
+    }
+
+    fn clear_terminal_selection(&mut self) -> bool {
+        let had_selection = self.terminal_selection.is_some()
+            || self.terminal_selecting
+            || self.pending_link_click.is_some();
+        self.terminal_selection = None;
+        self.terminal_selecting = false;
+        self.pending_link_click = None;
+        self.terminal.set_selection_phase(SelectionPhase::Idle);
+        had_selection
+    }
+
+    fn selection_mode_for_click_count(click_count: usize) -> SelectionMode {
+        match click_count {
+            0 | 1 => SelectionMode::Cell,
+            2 => SelectionMode::Word,
+            _ => SelectionMode::Line,
+        }
+    }
+
+    fn link_activation_modifiers(modifiers: gpui::Modifiers) -> bool {
+        modifiers.platform || modifiers.control
+    }
+
+    fn terminal_cell_point_for_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<(TerminalGridPoint, (f32, f32))> {
+        let (pos_x, pos_y) = Self::terminal_surface_position(position, self.element_bounds.get())?;
+        if pos_x < 0.0 || pos_y < 0.0 || self.cell_width <= 0.0 || self.cell_height <= 0.0 {
+            return None;
+        }
+
+        let cols = self.terminal.last_content.terminal_bounds.cols.max(1);
+        let rows = self
+            .terminal
+            .last_content
+            .terminal_bounds
+            .rows
+            .max(self.terminal.last_content.cells.len() as u16)
+            .max(1);
+        let col = (pos_x / self.cell_width).floor() as u16;
+        let row = (pos_y / self.cell_height).floor() as u16;
+        Some((
+            TerminalGridPoint::new(row.min(rows - 1), col.min(cols - 1)),
+            (pos_x, pos_y),
+        ))
+    }
+
+    fn terminal_selection_point_for_position(
+        &self,
+        position: gpui::Point<Pixels>,
+        anchor: TerminalGridPoint,
+    ) -> Option<TerminalGridPoint> {
+        let (point, _) = self.terminal_cell_point_for_position(position)?;
+        let cols = self.terminal.last_content.terminal_bounds.cols.max(1);
+        let col = if point.row > anchor.row || (point.row == anchor.row && point.col >= anchor.col)
+        {
+            point.col.saturating_add(1).min(cols)
+        } else {
+            point.col
+        };
+        Some(TerminalGridPoint::new(point.row, col))
+    }
+
+    fn pending_link_click_for_position(
+        &self,
+        position: gpui::Point<Pixels>,
+    ) -> Option<PendingLinkClick> {
+        let (point, surface_position) = self.terminal_cell_point_for_position(position)?;
+        let link = self.terminal.last_content.link_at(point)?;
+        Some(PendingLinkClick {
+            link_id: link.id,
+            uri: link.uri.clone(),
+            start_point: point,
+            start_surface_position: surface_position,
+        })
+    }
+
+    fn update_hovered_link(
+        &mut self,
+        position: gpui::Point<Pixels>,
+        modifiers: gpui::Modifiers,
+    ) -> bool {
+        let link_hover_enabled =
+            !self.terminal.is_mouse_tracking() || Self::link_activation_modifiers(modifiers);
+        let next = if link_hover_enabled {
+            self.terminal_cell_point_for_position(position)
+                .and_then(|(point, _)| {
+                    self.terminal
+                        .last_content
+                        .link_at(point)
+                        .map(|link| link.id)
+                })
+        } else {
+            None
+        };
+        if self.hovered_link_id == next {
+            return false;
+        }
+        self.hovered_link_id = next;
+        true
+    }
+
+    fn begin_terminal_selection(
+        &mut self,
+        point: TerminalGridPoint,
+        mode: SelectionMode,
+        cx: &mut Context<Self>,
+    ) {
+        let cols = self.terminal.last_content.terminal_bounds.cols.max(1);
+        let active = if mode == SelectionMode::Cell {
+            point
+        } else {
+            TerminalGridPoint::new(point.row, point.col.saturating_add(1).min(cols))
+        };
+        self.pending_link_click = None;
+        self.hovered_link_id = None;
+        self.terminal_selection = Some(TerminalSelection::new(point, active, mode));
+        self.terminal_selecting = true;
+        self.terminal.set_selection_phase(SelectionPhase::Selecting);
+        cx.notify();
+    }
+
+    fn update_terminal_selection(&mut self, position: gpui::Point<Pixels>, cx: &mut Context<Self>) {
+        let Some(anchor) = self
+            .terminal_selection
+            .as_ref()
+            .map(|selection| selection.anchor)
+        else {
+            return;
+        };
+        let Some(active) = self.terminal_selection_point_for_position(position, anchor) else {
+            return;
+        };
+        if let Some(selection) = &mut self.terminal_selection
+            && selection.active != active
+        {
+            selection.set_active(active);
+            cx.notify();
+        }
+    }
+
+    fn pending_link_dragged(
+        &self,
+        pending: &PendingLinkClick,
+        position: gpui::Point<Pixels>,
+    ) -> bool {
+        const LINK_DRAG_THRESHOLD_PX: f32 = 4.0;
+        let Some((pos_x, pos_y)) =
+            Self::terminal_surface_position(position, self.element_bounds.get())
+        else {
+            return true;
+        };
+        let dx = pos_x - pending.start_surface_position.0;
+        let dy = pos_y - pending.start_surface_position.1;
+        dx.hypot(dy) > LINK_DRAG_THRESHOLD_PX
     }
 
     fn mouse_mods(modifiers: gpui::Modifiers) -> key::Mods {
@@ -1327,6 +1522,38 @@ impl TerminalView {
         if !self.is_interactive() {
             return;
         }
+        if event.button == MouseButton::Left {
+            let mouse_tracking = self.terminal.is_mouse_tracking();
+            let selection_override = !mouse_tracking || event.modifiers.shift;
+            if selection_override {
+                if !event.modifiers.shift
+                    && event.click_count == 1
+                    && let Some(pending) = self.pending_link_click_for_position(event.position)
+                {
+                    self.hovered_link_id = Some(pending.link_id);
+                    self.pending_link_click = Some(pending);
+                    cx.notify();
+                    return;
+                }
+
+                if let Some((point, _)) = self.terminal_cell_point_for_position(event.position) {
+                    self.begin_terminal_selection(
+                        point,
+                        Self::selection_mode_for_click_count(event.click_count),
+                        cx,
+                    );
+                    return;
+                }
+            } else if Self::link_activation_modifiers(event.modifiers)
+                && event.click_count == 1
+                && let Some(pending) = self.pending_link_click_for_position(event.position)
+            {
+                self.hovered_link_id = Some(pending.link_id);
+                self.pending_link_click = Some(pending);
+                cx.notify();
+                return;
+            }
+        }
         let Some(button) = Self::ghostty_mouse_button(event.button) else {
             return;
         };
@@ -1361,6 +1588,38 @@ impl TerminalView {
         if !self.is_interactive() {
             return;
         }
+        if event.button == MouseButton::Left {
+            if let Some(pending) = self.pending_link_click.take() {
+                let same_link = self
+                    .pending_link_click_for_position(event.position)
+                    .map(|link| link.link_id == pending.link_id)
+                    .unwrap_or(false);
+                if same_link && !self.pending_link_dragged(&pending, event.position) {
+                    cx.open_url(&pending.uri);
+                }
+                self.hovered_link_id = None;
+                cx.notify();
+                return;
+            }
+
+            if self.terminal_selecting {
+                self.terminal_selecting = false;
+                self.terminal.set_selection_phase(SelectionPhase::Ended);
+                if self
+                    .terminal_selection
+                    .as_ref()
+                    .map(|selection| {
+                        selected_text_for_selection(&self.terminal.last_content, selection)
+                            .is_empty()
+                    })
+                    .unwrap_or(false)
+                {
+                    self.clear_terminal_selection();
+                }
+                cx.notify();
+                return;
+            }
+        }
         let Some(button) = Self::ghostty_mouse_button(event.button) else {
             return;
         };
@@ -1393,8 +1652,42 @@ impl TerminalView {
         cx: &mut Context<Self>,
     ) {
         if !self.is_interactive() || !self.terminal.is_mouse_tracking() {
+            if self.is_interactive() {
+                let hover_changed = self.update_hovered_link(event.position, event.modifiers);
+                if let Some(pending) = self.pending_link_click.clone()
+                    && event.dragging()
+                    && self.pending_link_dragged(&pending, event.position)
+                {
+                    self.begin_terminal_selection(pending.start_point, SelectionMode::Cell, cx);
+                    self.update_terminal_selection(event.position, cx);
+                    return;
+                }
+                if self.terminal_selecting && event.dragging() {
+                    self.update_terminal_selection(event.position, cx);
+                    return;
+                }
+                if hover_changed {
+                    cx.notify();
+                }
+            }
             return;
         }
+        if let Some(pending) = self.pending_link_click.clone() {
+            if event.dragging() && self.pending_link_dragged(&pending, event.position) {
+                self.begin_terminal_selection(pending.start_point, SelectionMode::Cell, cx);
+                self.update_terminal_selection(event.position, cx);
+                return;
+            }
+            if self.update_hovered_link(event.position, event.modifiers) {
+                cx.notify();
+            }
+            return;
+        }
+        if self.terminal_selecting && event.dragging() {
+            self.update_terminal_selection(event.position, cx);
+            return;
+        }
+        let hover_changed = self.update_hovered_link(event.position, event.modifiers);
         let any_pressed = self.mouse_buttons_pressed.any();
         self.terminal.set_mouse_any_button_pressed(any_pressed);
         self.terminal.set_mouse_track_last_cell(true);
@@ -1413,6 +1706,8 @@ impl TerminalView {
         );
         if any_pressed {
             self.show_cursor_now(cx);
+            cx.notify();
+        } else if hover_changed {
             cx.notify();
         }
     }
@@ -1678,6 +1973,7 @@ impl InputHandler for TerminalInputHandler {
             }
             view.ime_preedit.clear();
             if !text.is_empty() {
+                view.clear_terminal_selection();
                 view.show_cursor_now(cx);
                 view.terminal.input(text.as_bytes());
             }
@@ -1714,6 +2010,7 @@ impl InputHandler for TerminalInputHandler {
             }
             if !view.ime_preedit.is_empty() {
                 let text = std::mem::take(&mut view.ime_preedit);
+                view.clear_terminal_selection();
                 view.show_cursor_now(cx);
                 view.terminal.input(text.as_bytes());
             }
@@ -1798,10 +2095,14 @@ impl Render for TerminalView {
         let terminal_canvas = render_terminal(
             content,
             config,
-            cw,
-            ch,
-            cursor_visible,
-            self.scrollbar_visible,
+            TerminalRenderOptions {
+                cell_width: cw,
+                cell_height: ch,
+                cursor_blink_visible: cursor_visible,
+                scrollbar_visible: self.scrollbar_visible,
+                selection: self.terminal_selection.as_ref(),
+                hovered_link_id: self.hovered_link_id,
+            },
             &self.render_cache,
         );
 
@@ -1844,6 +2145,9 @@ impl Render for TerminalView {
             .font_family(config.font_family.clone())
             .text_size(px(config.font_size))
             .line_height(px(ch))
+            .when(self.hovered_link_id.is_some(), |style| {
+                style.cursor_pointer()
+            })
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_terminal_mouse_down))
@@ -1867,6 +2171,7 @@ impl Render for TerminalView {
                     return;
                 }
                 if let Some(mapped) = Self::map_keystroke(&event.keystroke) {
+                    this.clear_terminal_selection();
                     this.show_cursor_now(cx);
                     if Self::dispatch_mapped_keystroke(
                         &mut this.terminal,

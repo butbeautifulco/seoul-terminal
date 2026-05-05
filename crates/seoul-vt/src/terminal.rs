@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::io::Write;
 use std::sync::{Arc, Mutex};
 
@@ -12,6 +13,7 @@ use smallvec::SmallVec;
 
 use crate::config::TerminalConfig;
 use crate::effects;
+use crate::selection::{TerminalHyperlinkCandidate, TerminalLink, TerminalRowInfo, refresh_links};
 
 /// Terminal bounds in pixel and cell dimensions.
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -60,6 +62,8 @@ pub struct RenderedCell {
     pub strikethrough: bool,
     pub faint: bool,
     pub wide: CellWidthKind,
+    pub hyperlink: bool,
+    pub link_id: Option<u64>,
 }
 
 /// Cursor information for rendering.
@@ -131,6 +135,8 @@ pub struct TerminalContent {
     pub bg_color: RgbColor,
     pub cursor_color: Option<RgbColor>,
     pub terminal_bounds: TerminalBounds,
+    pub row_info: Vec<TerminalRowInfo>,
+    pub links: Vec<TerminalLink>,
     pub scrollbar: Option<ScrollbarState>,
     pub bell_count: u64,
     pub dirty_rows: Vec<u16>,
@@ -154,6 +160,8 @@ impl Default for TerminalContent {
             },
             cursor_color: None,
             terminal_bounds: TerminalBounds::default(),
+            row_info: Vec::new(),
+            links: Vec::new(),
             scrollbar: None,
             bell_count: 0,
             dirty_rows: Vec::new(),
@@ -225,6 +233,158 @@ impl Drop for SilentReplayGuard {
     }
 }
 
+#[derive(Debug)]
+struct TerminalHyperlinkTracker {
+    state: HyperlinkParserState,
+    active: Option<ActiveHyperlink>,
+    candidates: VecDeque<TerminalHyperlinkCandidate>,
+}
+
+impl Default for TerminalHyperlinkTracker {
+    fn default() -> Self {
+        Self {
+            state: HyperlinkParserState::Normal,
+            active: None,
+            candidates: VecDeque::new(),
+        }
+    }
+}
+
+impl TerminalHyperlinkTracker {
+    const MAX_CANDIDATES: usize = 2048;
+
+    fn observe(&mut self, data: &[u8]) {
+        for byte in data {
+            self.observe_byte(*byte);
+        }
+    }
+
+    fn candidates(&self) -> Vec<TerminalHyperlinkCandidate> {
+        self.candidates.iter().cloned().collect()
+    }
+
+    fn observe_byte(&mut self, byte: u8) {
+        let state = std::mem::replace(&mut self.state, HyperlinkParserState::Normal);
+        self.state = match state {
+            HyperlinkParserState::Normal => match byte {
+                b'\x1b' => HyperlinkParserState::Escape,
+                0x20..=0x7e | 0x80..=0xff => {
+                    self.append_active_byte(byte);
+                    HyperlinkParserState::Normal
+                }
+                b'\n' | b'\r' | b'\t' => {
+                    self.append_active_byte(byte);
+                    HyperlinkParserState::Normal
+                }
+                _ => HyperlinkParserState::Normal,
+            },
+            HyperlinkParserState::Escape => match byte {
+                b']' => HyperlinkParserState::Osc {
+                    bytes: Vec::new(),
+                    escaped: false,
+                },
+                b'[' => HyperlinkParserState::Csi,
+                _ => HyperlinkParserState::Normal,
+            },
+            HyperlinkParserState::Csi => {
+                if (0x40..=0x7e).contains(&byte) {
+                    HyperlinkParserState::Normal
+                } else {
+                    HyperlinkParserState::Csi
+                }
+            }
+            HyperlinkParserState::Osc {
+                mut bytes,
+                mut escaped,
+            } => {
+                if escaped {
+                    if byte == b'\\' {
+                        self.handle_osc(&bytes);
+                        HyperlinkParserState::Normal
+                    } else {
+                        bytes.push(b'\x1b');
+                        bytes.push(byte);
+                        escaped = false;
+                        HyperlinkParserState::Osc { bytes, escaped }
+                    }
+                } else if byte == b'\x07' {
+                    self.handle_osc(&bytes);
+                    HyperlinkParserState::Normal
+                } else if byte == b'\x1b' {
+                    escaped = true;
+                    HyperlinkParserState::Osc { bytes, escaped }
+                } else {
+                    bytes.push(byte);
+                    HyperlinkParserState::Osc { bytes, escaped }
+                }
+            }
+        };
+    }
+
+    fn append_active_byte(&mut self, byte: u8) {
+        if let Some(active) = &mut self.active {
+            active.text.push(byte);
+        }
+    }
+
+    fn handle_osc(&mut self, payload: &[u8]) {
+        let Some(uri) = parse_osc8_uri(payload) else {
+            return;
+        };
+
+        if uri.is_empty() {
+            self.finish_active();
+        } else {
+            self.finish_active();
+            self.active = Some(ActiveHyperlink {
+                uri,
+                text: Vec::new(),
+            });
+        }
+    }
+
+    fn finish_active(&mut self) {
+        let Some(active) = self.active.take() else {
+            return;
+        };
+        let text = String::from_utf8_lossy(&active.text).to_string();
+        if active.uri.is_empty() || text.is_empty() {
+            return;
+        }
+        if self.candidates.len() == Self::MAX_CANDIDATES {
+            self.candidates.pop_front();
+        }
+        self.candidates.push_back(TerminalHyperlinkCandidate {
+            uri: active.uri,
+            text,
+        });
+    }
+}
+
+#[derive(Debug)]
+enum HyperlinkParserState {
+    Normal,
+    Escape,
+    Csi,
+    Osc { bytes: Vec<u8>, escaped: bool },
+}
+
+#[derive(Debug)]
+struct ActiveHyperlink {
+    uri: String,
+    text: Vec<u8>,
+}
+
+fn parse_osc8_uri(payload: &[u8]) -> Option<String> {
+    let payload = String::from_utf8_lossy(payload);
+    let mut parts = payload.splitn(3, ';');
+    if parts.next()? != "8" {
+        return None;
+    }
+    parts.next()?;
+    Some(parts.next().unwrap_or_default().to_string())
+}
+
 // ── TerminalResizer trait ────────────────────────────────────
 
 /// Abstraction for resizing the backing PTY or sending a resize message to the daemon.
@@ -289,6 +449,7 @@ pub struct Terminal {
 
     pty_writer: SharedWriter,
     resizer: Box<dyn TerminalResizer>,
+    hyperlink_tracker: TerminalHyperlinkTracker,
 
     // Kept alive to prevent the child process from being killed (local PTY mode).
     #[allow(dead_code)]
@@ -389,6 +550,7 @@ impl Terminal {
 
     /// Feed PTY output data into the terminal emulator.
     pub fn feed_pty_data(&mut self, data: &[u8]) {
+        self.hyperlink_tracker.observe(data);
         self.ghostty.vt_write(data);
     }
 
@@ -396,6 +558,7 @@ impl Terminal {
     /// Used for scrollback replay where DA/DSR responses must be suppressed.
     pub fn feed_pty_data_silently(&mut self, data: &[u8]) {
         let _guard = SilentReplayGuard::new(self.pty_writer.clone(), self.effect_state.clone());
+        self.hyperlink_tracker.observe(data);
         self.ghostty.vt_write(data);
     }
 
@@ -533,6 +696,9 @@ impl Terminal {
         // inner Vec allocations come along and stay reusable.
         let mut cells = std::mem::take(&mut self.last_content.cells);
         cells.resize_with(rows_count, Vec::new);
+        self.last_content
+            .row_info
+            .resize(rows_count, TerminalRowInfo::default());
 
         let fg_default = self.last_content.fg_color;
         let bg_default = self.last_content.bg_color;
@@ -559,6 +725,11 @@ impl Terminal {
                     continue;
                 }
 
+                self.last_content.row_info[row_idx].is_wrapped = row
+                    .raw_row()
+                    .ok()
+                    .and_then(|raw_row| raw_row.is_wrapped().ok())
+                    .unwrap_or(false);
                 self.last_content.dirty_rows.push(row_idx as u16);
                 touched_rows = true;
                 let row_cells = &mut cells[row_idx];
@@ -567,11 +738,13 @@ impl Terminal {
                 if let Ok(mut cell_iter) = self.cell_iterator.update(row) {
                     let mut col_idx: u16 = 0;
                     while let Some(cell) = cell_iter.next() {
-                        let cell_wide = cell
-                            .raw_cell()
-                            .ok()
+                        let raw_cell = cell.raw_cell().ok();
+                        let cell_wide = raw_cell
                             .and_then(|rc| rc.wide().ok())
                             .unwrap_or(CellWide::Narrow);
+                        let hyperlink = raw_cell
+                            .and_then(|rc| rc.has_hyperlink().ok())
+                            .unwrap_or(false);
                         let wide = match cell_wide {
                             CellWide::Narrow => CellWidthKind::Narrow,
                             CellWide::Wide => CellWidthKind::Wide,
@@ -595,6 +768,8 @@ impl Terminal {
                                 strikethrough: false,
                                 faint: false,
                                 wide,
+                                hyperlink,
+                                link_id: None,
                             });
                             col_idx += 1;
                             continue;
@@ -629,6 +804,8 @@ impl Terminal {
                             strikethrough: style.as_ref().map(|s| s.strikethrough).unwrap_or(false),
                             faint: style.as_ref().map(|s| s.faint).unwrap_or(false),
                             wide,
+                            hyperlink,
+                            link_id: None,
                         });
                         col_idx += 1;
                     }
@@ -661,6 +838,7 @@ impl Terminal {
         }
 
         self.last_content.cells = cells;
+        refresh_links(&mut self.last_content, &self.hyperlink_tracker.candidates());
     }
 
     /// Check if the terminal is in mouse tracking mode.
@@ -873,6 +1051,7 @@ impl TerminalBuilder {
             resizer: Box::new(PtyResizer {
                 master: pair.master,
             }),
+            hyperlink_tracker: TerminalHyperlinkTracker::default(),
             _child: Some(child),
             last_content: TerminalContent::default(),
             selection_phase: SelectionPhase::Idle,
@@ -904,6 +1083,7 @@ impl TerminalBuilder {
             effect_state,
             pty_writer,
             resizer: Box::new(DaemonResizer),
+            hyperlink_tracker: TerminalHyperlinkTracker::default(),
             _child: None,
             last_content: TerminalContent::default(),
             selection_phase: SelectionPhase::Idle,

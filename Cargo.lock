@@ -5287,6 +5287,7 @@ dependencies = [
  "gpui",
  "libghostty-vt",
  "portable-pty",
+ "regex",
  "smallvec",
  "smol",
  "tracing",
