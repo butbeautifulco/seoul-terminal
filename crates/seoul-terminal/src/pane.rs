@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 use crate::icons::{Icon, IconName};
 use crate::item::ItemHandle;
+use crate::tab_kind::TabKind;
 use crate::theme;
 
 const MAX_CLOSED_TABS: usize = 10;
@@ -18,25 +19,21 @@ const MAX_CLOSED_TABS: usize = 10;
 pub struct TabEntry {
     pub id: Uuid,
     pub item: Box<dyn ItemHandle>,
-    pub kind_id: &'static str,
+    pub kind: TabKind,
     pub path: Option<PathBuf>,
     pub restore: Option<PersistedTabKind>,
 }
 
 pub struct TabMetadata {
-    pub kind_id: &'static str,
+    pub kind: TabKind,
     pub path: Option<PathBuf>,
     pub restore: Option<PersistedTabKind>,
 }
 
 impl TabMetadata {
-    pub fn new(
-        kind_id: &'static str,
-        path: Option<PathBuf>,
-        restore: Option<PersistedTabKind>,
-    ) -> Self {
+    pub fn new(kind: TabKind, path: Option<PathBuf>, restore: Option<PersistedTabKind>) -> Self {
         Self {
-            kind_id,
+            kind,
             path,
             restore,
         }
@@ -62,7 +59,7 @@ impl TabEntry {
 #[allow(dead_code)]
 pub struct ClosedTab {
     pub tab_id: Uuid,
-    pub kind_id: &'static str,
+    pub kind: TabKind,
 }
 
 // ---------------------------------------------------------------------------
@@ -74,7 +71,7 @@ pub enum PaneEvent {
     ActivateItem(#[allow(dead_code)] Uuid),
     CloseItem {
         tab_id: Uuid,
-        kind_id: &'static str,
+        kind: TabKind,
     },
     ItemAdded,
     #[allow(dead_code)]
@@ -118,7 +115,7 @@ impl Pane {
         self.tabs.push(TabEntry {
             id,
             item,
-            kind_id: metadata.kind_id,
+            kind: metadata.kind,
             path: metadata.path,
             restore: metadata.restore,
         });
@@ -139,7 +136,7 @@ impl Pane {
         self.tabs.push(TabEntry {
             id,
             item,
-            kind_id: metadata.kind_id,
+            kind: metadata.kind,
             path: metadata.path,
             restore: metadata.restore,
         });
@@ -189,22 +186,22 @@ impl Pane {
         true
     }
 
-    /// Close a tab by id. Returns the removed TabEntry's kind_id.
+    /// Close a tab by id. Returns the removed TabEntry's kind.
     pub fn close_item(&mut self, tab_id: Uuid, window: &mut Window, cx: &mut Context<Self>) {
         let Some(idx) = self.tabs.iter().position(|t| t.id == tab_id) else {
             return;
         };
 
-        let kind_id = self.tabs[idx].kind_id;
+        let kind = self.tabs[idx].kind;
 
         // Remember for undo-close
-        self.closed_tabs.push(ClosedTab { tab_id, kind_id });
+        self.closed_tabs.push(ClosedTab { tab_id, kind });
         while self.closed_tabs.len() > MAX_CLOSED_TABS {
             self.closed_tabs.remove(0);
         }
 
         self.tabs.remove(idx);
-        cx.emit(PaneEvent::CloseItem { tab_id, kind_id });
+        cx.emit(PaneEvent::CloseItem { tab_id, kind });
 
         // Activate adjacent tab
         if !self.tabs.is_empty() {
@@ -233,9 +230,9 @@ impl Pane {
     }
 
     /// Find an existing tab by kind + path match.
-    pub fn find_tab_by_path(&self, kind_id: &str, path: &PathBuf) -> Option<Uuid> {
+    pub fn find_tab_by_path(&self, kind: TabKind, path: &PathBuf) -> Option<Uuid> {
         self.tabs.iter().find_map(|t| {
-            if t.kind_id == kind_id && t.path.as_ref() == Some(path) {
+            if t.kind == kind && t.path.as_ref() == Some(path) {
                 Some(t.id)
             } else {
                 None
@@ -243,12 +240,9 @@ impl Pane {
         })
     }
 
-    /// Find an existing tab by kind_id.
-    pub fn find_tab_by_kind(&self, kind_id: &str) -> Option<Uuid> {
-        self.tabs
-            .iter()
-            .find(|t| t.kind_id == kind_id)
-            .map(|t| t.id)
+    /// Find an existing tab by kind.
+    pub fn find_tab_by_kind(&self, kind: TabKind) -> Option<Uuid> {
+        self.tabs.iter().find(|t| t.kind == kind).map(|t| t.id)
     }
 
     /// Get active tab entry.
@@ -259,10 +253,10 @@ impl Pane {
 
     /// Tab ids of given kind (for serialization).
     #[allow(dead_code)]
-    pub fn tab_ids_of_kind(&self, kind_id: &str) -> Vec<Uuid> {
+    pub fn tab_ids_of_kind(&self, kind: TabKind) -> Vec<Uuid> {
         self.tabs
             .iter()
-            .filter(|t| t.kind_id == kind_id)
+            .filter(|t| t.kind == kind)
             .map(|t| t.id)
             .collect()
     }
@@ -290,11 +284,11 @@ impl Pane {
             let is_active = active_tab_id == Some(tab_id);
             let title = tab.item.tab_title(cx);
             let dirty = tab.item.is_dirty(cx);
-            let icon = match tab.kind_id {
-                "terminal" => IconName::Terminal,
-                "settings" => IconName::Settings,
-                "diff" => IconName::FileCode,
-                _ => IconName::File,
+            let icon = match tab.kind {
+                TabKind::Terminal => IconName::Terminal,
+                TabKind::Settings => IconName::Settings,
+                TabKind::Diff => IconName::FileCode,
+                TabKind::Editor => IconName::File,
             };
 
             bar = bar.child(
@@ -454,8 +448,8 @@ mod tests {
             "Fake".into()
         }
 
-        fn tab_kind_id(&self, _cx: &App) -> &'static str {
-            "fake"
+        fn tab_kind(&self, _cx: &App) -> TabKind {
+            TabKind::Terminal
         }
 
         fn is_dirty(&self, _cx: &App) -> bool {
@@ -482,7 +476,7 @@ mod tests {
             unreachable!()
         }
 
-        fn tab_kind_id(&self, _cx: &App) -> &'static str {
+        fn tab_kind(&self, _cx: &App) -> TabKind {
             unreachable!()
         }
 
@@ -507,7 +501,7 @@ mod tests {
         TabEntry {
             id,
             item: Box::new(FakeItemHandle),
-            kind_id: "fake",
+            kind: TabKind::Terminal,
             path: None,
             restore,
         }
@@ -517,7 +511,7 @@ mod tests {
         TabEntry {
             id,
             item: Box::new(FocusableFakeItemHandle { focus_handle }),
-            kind_id: "fake",
+            kind: TabKind::Terminal,
             path: None,
             restore: None,
         }

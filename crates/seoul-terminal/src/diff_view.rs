@@ -125,8 +125,8 @@ impl crate::item::Item for DiffView {
         self.title()
     }
 
-    fn tab_kind_id(&self) -> &'static str {
-        "diff"
+    fn tab_kind(&self) -> crate::tab_kind::TabKind {
+        crate::tab_kind::TabKind::Diff
     }
 }
 
