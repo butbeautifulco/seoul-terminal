@@ -52,6 +52,52 @@ pub enum EditorEvent {
 
 impl EventEmitter<EditorEvent> for EditorView {}
 
+// -- Render memoization --
+
+/// Buffer version identifier. Incremented by every mutation.
+#[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
+pub struct BufferVersion(pub u64);
+
+/// Quantized scroll offset (in pixels, integer-bucketed) used as a
+/// cache key. Two render passes at the same scroll bucket reuse the
+/// same visible-line range.
+#[derive(Copy, Clone, PartialEq, Eq, Default, Debug)]
+pub struct ScrollOffset(pub usize);
+
+/// Cache for the per-render-pass derived data:
+///   - which lines are visible (snapshotted as `Vec<String>`)
+///   - line byte offsets (start..end for each visible line)
+///   - per-line tree-sitter highlight spans
+///
+/// Keyed by `(buffer version, visible line range, scroll offset)`.
+/// Any one of those changing forces a fresh recomputation; otherwise
+/// the previous frame's snapshot is reused.
+#[derive(Default)]
+struct RenderCache {
+    key: Option<(BufferVersion, std::ops::Range<usize>, ScrollOffset)>,
+    visible_lines: Vec<String>,
+    line_byte_offsets: Vec<(usize, usize)>,
+    highlight_spans: Vec<Vec<crate::syntax::HighlightSpan>>,
+}
+
+impl RenderCache {
+    fn is_fresh(
+        &self,
+        ver: BufferVersion,
+        range: std::ops::Range<usize>,
+        scroll: ScrollOffset,
+    ) -> bool {
+        self.key
+            .as_ref()
+            .map(|k| k == &(ver, range, scroll))
+            .unwrap_or(false)
+    }
+
+    fn update(&mut self, ver: BufferVersion, range: std::ops::Range<usize>, scroll: ScrollOffset) {
+        self.key = Some((ver, range, scroll));
+    }
+}
+
 // -- Cursor blink epoch helper --
 
 /// Monotonic epoch counter for cursor-blink timer callbacks.
@@ -108,6 +154,11 @@ pub struct EditorView {
     last_edit_epoch: std::time::Instant,
     last_blink_toggle: std::time::Instant,
     blink: BlinkState,
+    // Render cache: avoids re-collecting visible lines and re-running
+    // tree-sitter highlight queries when nothing has changed since the
+    // previous render pass. Keyed by (buffer version, visible range,
+    // scroll bucket) — see `RenderCache::is_fresh`.
+    render_cache: RenderCache,
 }
 
 impl EditorView {
@@ -156,6 +207,7 @@ impl EditorView {
             last_edit_epoch: std::time::Instant::now(),
             last_blink_toggle: std::time::Instant::now(),
             blink: BlinkState::default(),
+            render_cache: RenderCache::default(),
         };
         // Bootstrap the blink cycle: pauses for BLINK_PAUSE so the first
         // toggle fires at +BLINK_PAUSE, matching activity-driven behavior.
@@ -1107,28 +1159,55 @@ impl Render for EditorView {
         let visible_count = (viewport_h / line_height).ceil() as usize + 2;
         let last_line = (first_line + visible_count).min(line_count);
 
-        // Collect visible line texts and byte offsets
-        let mut visible_lines: Vec<String> = Vec::with_capacity(last_line - first_line);
-        let mut line_byte_offsets: Vec<(usize, usize)> = Vec::with_capacity(last_line - first_line);
-        for line_idx in first_line..last_line {
-            let text = self.buffer.line_text(line_idx);
-            let start = self.buffer.line_to_byte(line_idx);
-            let end = start + text.len();
-            line_byte_offsets.push((start, end));
-            visible_lines.push(text);
+        // Build the cache key: buffer version + visible line range +
+        // scroll offset (rounded to integer pixels — sub-pixel scroll
+        // jitter wouldn't change which lines we paint).
+        let buffer_version = BufferVersion(self.buffer.version());
+        let visible_range = first_line..last_line;
+        let scroll_bucket = ScrollOffset(scroll_offset.max(0.0) as usize);
+
+        if !self
+            .render_cache
+            .is_fresh(buffer_version, visible_range.clone(), scroll_bucket)
+        {
+            // Collect visible line texts and byte offsets
+            let mut visible_lines: Vec<String> = Vec::with_capacity(last_line - first_line);
+            let mut line_byte_offsets: Vec<(usize, usize)> =
+                Vec::with_capacity(last_line - first_line);
+            for line_idx in first_line..last_line {
+                let text = self.buffer.line_text(line_idx);
+                let start = self.buffer.line_to_byte(line_idx);
+                let end = start + text.len();
+                line_byte_offsets.push((start, end));
+                visible_lines.push(text);
+            }
+
+            // Get highlight spans for visible range
+            let visible_byte_range = if !line_byte_offsets.is_empty() {
+                line_byte_offsets[0].0..line_byte_offsets.last().map_or(0, |l| l.1)
+            } else {
+                0..0
+            };
+            let highlight_spans = self.highlighter.highlight_lines(
+                self.buffer.rope(),
+                visible_byte_range,
+                &line_byte_offsets,
+            );
+
+            self.render_cache.visible_lines = visible_lines;
+            self.render_cache.line_byte_offsets = line_byte_offsets;
+            self.render_cache.highlight_spans = highlight_spans;
+            self.render_cache
+                .update(buffer_version, visible_range, scroll_bucket);
         }
 
-        // Get highlight spans for visible range
-        let visible_byte_range = if !line_byte_offsets.is_empty() {
-            line_byte_offsets[0].0..line_byte_offsets.last().map_or(0, |l| l.1)
-        } else {
-            0..0
-        };
-        let highlight_spans = self.highlighter.highlight_lines(
-            self.buffer.rope(),
-            visible_byte_range,
-            &line_byte_offsets,
-        );
+        // Hand the canvas snapshot copies — `render_editor_content`
+        // takes owned `Vec<String>` / `Vec<Vec<HighlightSpan>>` because
+        // it captures into the canvas closure. The clones here are
+        // cheap relative to a tree-sitter highlight pass, and skipping
+        // them entirely would require redesigning EditorRenderParams.
+        let visible_lines = self.render_cache.visible_lines.clone();
+        let highlight_spans = self.render_cache.highlight_spans.clone();
 
         let editor_canvas = render_editor_content(EditorRenderParams {
             visible_lines,
@@ -1212,5 +1291,27 @@ mod tests {
         let stale = e.bump();
         let _fresh = e.bump();
         assert!(!e.should_tick(stale));
+    }
+
+    #[::core::prelude::v1::test]
+    fn render_cache_invalidates_on_buffer_version_change() {
+        let mut cache = RenderCache::default();
+        cache.update(BufferVersion(1), 0..20, ScrollOffset(0));
+        assert!(cache.is_fresh(BufferVersion(1), 0..20, ScrollOffset(0)));
+        assert!(!cache.is_fresh(BufferVersion(2), 0..20, ScrollOffset(0)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn render_cache_invalidates_on_scroll() {
+        let mut cache = RenderCache::default();
+        cache.update(BufferVersion(1), 0..20, ScrollOffset(0));
+        assert!(!cache.is_fresh(BufferVersion(1), 0..20, ScrollOffset(40)));
+    }
+
+    #[::core::prelude::v1::test]
+    fn render_cache_invalidates_on_visible_range_change() {
+        let mut cache = RenderCache::default();
+        cache.update(BufferVersion(1), 0..20, ScrollOffset(0));
+        assert!(!cache.is_fresh(BufferVersion(1), 5..25, ScrollOffset(0)));
     }
 }
