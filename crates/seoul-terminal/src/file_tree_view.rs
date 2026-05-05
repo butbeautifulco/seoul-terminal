@@ -155,12 +155,10 @@ impl FileTreeView {
         cx.notify();
     }
 
-    fn render_entry(
-        &self,
-        index: usize,
-        entry: &FileTreeEntry,
-        cx: &mut Context<Self>,
-    ) -> AnyElement {
+    fn render_entry(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(entry) = self.entries.get(index) else {
+            return div().into_any_element();
+        };
         let t = theme::theme(cx);
         let path = entry.path.clone();
         let is_dir = entry.is_dir;
@@ -168,6 +166,12 @@ impl FileTreeView {
         let name = entry.name.clone();
         let is_selected = self.selected_path.as_ref() == Some(&entry.path);
         let is_expanded = is_dir && self.expanded_dirs.contains(&entry.path);
+        // Compute git color once per entry (used for both icon and label).
+        let git_color = if is_dir {
+            None
+        } else {
+            self.git_color_for_path(&entry.path, &t)
+        };
 
         div()
             .id(ElementId::Name(format!("ft-{index}").into()))
@@ -215,8 +219,8 @@ impl FileTreeView {
                     },
                     if is_dir {
                         rgb(t.overlay2)
-                    } else if let Some(git_color) = self.git_color_for_path(&entry.path, &t) {
-                        git_color
+                    } else if let Some(c) = git_color {
+                        c
                     } else {
                         rgb(t.overlay0)
                     },
@@ -228,8 +232,8 @@ impl FileTreeView {
                     .text_size(px(12.))
                     .text_color(if is_dir {
                         rgb(t.text)
-                    } else if let Some(git_color) = self.git_color_for_path(&entry.path, &t) {
-                        git_color
+                    } else if let Some(c) = git_color {
+                        c
                     } else {
                         rgb(t.subtext0)
                     })
@@ -258,6 +262,7 @@ impl Focusable for FileTreeView {
 impl Render for FileTreeView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme::theme(cx);
+        let entry_count = self.entries.len();
         let mut container = div()
             .id("file-tree")
             .key_context("file-tree")
@@ -266,7 +271,6 @@ impl Render for FileTreeView {
             .flex()
             .flex_col()
             .bg(rgb(t.mantle))
-            .overflow_y_scroll()
             // Header
             .child(
                 div().flex_none().px(px(12.)).py(px(10.)).child(
@@ -278,16 +282,8 @@ impl Render for FileTreeView {
                 ),
             );
 
-        // Entries
-        let entry_count = self.entries.len();
-        for i in 0..entry_count {
-            let entry = &self.entries[i];
-            let rendered = self.render_entry(i, entry, cx);
-            container = container.child(rendered);
-        }
-
-        // Empty state
-        if self.entries.is_empty() {
+        if entry_count == 0 {
+            // Empty state
             container = container.child(
                 div()
                     .px(px(12.))
@@ -299,6 +295,19 @@ impl Render for FileTreeView {
                     } else {
                         "Select a workspace to browse files."
                     }),
+            );
+        } else {
+            // Virtualized list — only the visible window is painted.
+            container = container.child(
+                uniform_list(
+                    "file-tree-entries",
+                    entry_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        range.map(|i| this.render_entry(i, cx)).collect::<Vec<_>>()
+                    }),
+                )
+                .flex_grow()
+                .into_any_element(),
             );
         }
 

@@ -50,7 +50,10 @@ impl DiffView {
         format!("{name} (diff)")
     }
 
-    fn render_line(&self, index: usize, line: &DiffLine, cx: &mut Context<Self>) -> AnyElement {
+    fn render_diff_line(&self, index: usize, cx: &mut Context<Self>) -> AnyElement {
+        let Some(line) = self.lines.get(index) else {
+            return div().into_any_element();
+        };
         let t = theme::theme(cx);
 
         let (bg, text_color) = match line.kind {
@@ -139,6 +142,7 @@ impl Focusable for DiffView {
 impl Render for DiffView {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let t = theme::theme(cx);
+        let line_count = self.lines.len();
 
         let mut container = div()
             .id("diff-view")
@@ -147,8 +151,7 @@ impl Render for DiffView {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(t.base))
-            .overflow_y_scroll();
+            .bg(rgb(t.base));
 
         // Header showing file path
         container = container.child(
@@ -164,13 +167,8 @@ impl Render for DiffView {
                 .child(self.path.clone()),
         );
 
-        // Diff lines
-        for (i, line) in self.lines.iter().enumerate() {
-            container = container.child(self.render_line(i, line, cx));
-        }
-
-        // Empty state
-        if self.lines.is_empty() {
+        if line_count == 0 {
+            // Empty state
             container = container.child(
                 div()
                     .px(px(12.))
@@ -178,6 +176,22 @@ impl Render for DiffView {
                     .text_size(px(12.))
                     .text_color(rgb(t.surface2))
                     .child("No differences found."),
+            );
+        } else {
+            // Virtualized list — only the visible window is painted.
+            // All diff rows have uniform 18px height (see render_diff_line).
+            container = container.child(
+                uniform_list(
+                    "diff-lines",
+                    line_count,
+                    cx.processor(|this, range: std::ops::Range<usize>, _window, cx| {
+                        range
+                            .map(|i| this.render_diff_line(i, cx))
+                            .collect::<Vec<_>>()
+                    }),
+                )
+                .flex_grow()
+                .into_any_element(),
             );
         }
 
