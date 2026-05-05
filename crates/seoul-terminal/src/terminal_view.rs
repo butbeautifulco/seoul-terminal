@@ -132,6 +132,16 @@ impl MouseButtonsPressed {
     }
 }
 
+enum MappedKeystroke {
+    Encoded {
+        key: gkey::Key,
+        mods: gkey::Mods,
+        utf8: Option<String>,
+        unshifted: Option<char>,
+    },
+    Raw(&'static [u8]),
+}
+
 impl TerminalView {
     fn config_from_settings(cx: &App) -> TerminalConfig {
         let s = cx.global::<SettingsStore>().global().terminal.clone();
@@ -1409,18 +1419,21 @@ impl TerminalView {
 
     /// Map a GPUI keystroke to libghostty key + mods.
     ///
-    /// Only handles special keys and modifier combos (Ctrl+X, Alt+X).
+    /// Only handles special keys and modifier combos (Ctrl+X, Alt+X, Cmd+Arrow).
     /// Regular printable characters (no Ctrl/Alt) are left to the IME
     /// InputHandler path (replace_text_in_range) to avoid double input.
-    fn map_keystroke(
-        keystroke: &Keystroke,
-    ) -> Option<(gkey::Key, gkey::Mods, Option<String>, Option<char>)> {
-        if keystroke.modifiers.platform {
-            return None;
-        }
-
+    fn map_keystroke(keystroke: &Keystroke) -> Option<MappedKeystroke> {
         let has_ctrl = keystroke.modifiers.control;
         let has_alt = keystroke.modifiers.alt;
+        let has_platform = keystroke.modifiers.platform;
+
+        if has_platform && !has_ctrl && !has_alt && !keystroke.modifiers.shift {
+            match keystroke.key.as_str() {
+                "left" | "up" => return Some(MappedKeystroke::Raw(b"\x01")),
+                "right" | "down" => return Some(MappedKeystroke::Raw(b"\x05")),
+                _ => {}
+            }
+        }
 
         let mut mods = gkey::Mods::empty();
         if has_ctrl {
@@ -1428,6 +1441,9 @@ impl TerminalView {
         }
         if has_alt {
             mods |= gkey::Mods::ALT;
+        }
+        if has_platform {
+            mods |= gkey::Mods::SUPER;
         }
         if keystroke.modifiers.shift {
             mods |= gkey::Mods::SHIFT;
@@ -1561,7 +1577,36 @@ impl TerminalView {
         };
 
         let utf8 = keystroke.key_char.as_ref().map(|s| s.to_string());
-        Some((key, mods, utf8, unshifted))
+        Some(MappedKeystroke::Encoded {
+            key,
+            mods,
+            utf8,
+            unshifted,
+        })
+    }
+
+    fn dispatch_mapped_keystroke(
+        terminal: &mut Terminal,
+        mapped: MappedKeystroke,
+        ime_preedit: &mut String,
+    ) -> bool {
+        if !ime_preedit.is_empty() {
+            let text = std::mem::take(ime_preedit);
+            terminal.input(text.as_bytes());
+        }
+
+        match mapped {
+            MappedKeystroke::Encoded {
+                key,
+                mods,
+                utf8,
+                unshifted,
+            } => terminal.try_keystroke(key, mods, utf8.as_deref(), unshifted),
+            MappedKeystroke::Raw(bytes) => {
+                terminal.input(bytes);
+                true
+            }
+        }
     }
 }
 
@@ -1583,7 +1628,7 @@ impl crate::item::Item for TerminalView {
 
 #[cfg(test)]
 mod tests {
-    use super::TerminalView;
+    use super::{MappedKeystroke, TerminalView};
     use gpui::{Keystroke, px, size};
     use libghostty_vt::{key as gkey, mouse};
     use seoul_terminal_proto::messages::SessionAttachedMsg;
@@ -1619,6 +1664,17 @@ mod tests {
             key: key.to_string(),
             modifiers: gpui::Modifiers {
                 control: true,
+                ..gpui::Modifiers::default()
+            },
+            ..Keystroke::default()
+        }
+    }
+
+    fn cmd_keystroke(key: &str) -> Keystroke {
+        Keystroke {
+            key: key.to_string(),
+            modifiers: gpui::Modifiers {
+                platform: true,
                 ..gpui::Modifiers::default()
             },
             ..Keystroke::default()
@@ -1680,15 +1736,27 @@ mod tests {
     fn maps_additional_fixed_keys() {
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("insert")),
-            Some((gkey::Key::Insert, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::Insert,
+                unshifted: None,
+                ..
+            })
         ));
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("f13")),
-            Some((gkey::Key::F13, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::F13,
+                unshifted: None,
+                ..
+            })
         ));
         assert!(matches!(
             TerminalView::map_keystroke(&keystroke("numpad_add")),
-            Some((gkey::Key::NumpadAdd, _, _, None))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::NumpadAdd,
+                unshifted: None,
+                ..
+            })
         ));
     }
 
@@ -1696,8 +1764,62 @@ mod tests {
     fn maps_unshifted_for_single_character_keys() {
         assert!(matches!(
             TerminalView::map_keystroke(&ctrl_keystroke("A")),
-            Some((gkey::Key::A, _, _, Some('a')))
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::A,
+                unshifted: Some('a'),
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn cmd_arrow_keys_map_to_shell_line_navigation() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("left")),
+            Some(MappedKeystroke::Raw(b"\x01"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("up")),
+            Some(MappedKeystroke::Raw(b"\x01"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("right")),
+            Some(MappedKeystroke::Raw(b"\x05"))
+        ));
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("down")),
+            Some(MappedKeystroke::Raw(b"\x05"))
+        ));
+    }
+
+    #[test]
+    fn cmd_printable_keys_stay_reserved_for_keybindings() {
+        assert!(TerminalView::map_keystroke(&cmd_keystroke("s")).is_none());
+    }
+
+    #[test]
+    fn cmd_non_arrow_special_keys_keep_super_modifier() {
+        assert!(matches!(
+            TerminalView::map_keystroke(&cmd_keystroke("home")),
+            Some(MappedKeystroke::Encoded {
+                key: gkey::Key::Home,
+                mods,
+                ..
+            }) if mods.contains(gkey::Mods::SUPER)
+        ));
+    }
+
+    #[test]
+    fn raw_mapped_keystrokes_write_to_terminal() {
+        let (mut terminal, captured) = captured_attached_terminal();
+        let mut ime_preedit = String::new();
+
+        assert!(TerminalView::dispatch_mapped_keystroke(
+            &mut terminal,
+            MappedKeystroke::Raw(b"\x01"),
+            &mut ime_preedit,
+        ));
+        assert_eq!(take(&captured), b"\x01");
     }
 
     #[test]
@@ -2054,15 +2176,15 @@ impl Render for TerminalView {
                 if !this.is_interactive() {
                     return;
                 }
-                if let Some((key, mods, utf8, unshifted)) = Self::map_keystroke(&event.keystroke) {
+                if let Some(mapped) = Self::map_keystroke(&event.keystroke) {
                     this.show_cursor_now(cx);
-                    // Commit pending IME preedit
-                    if !this.ime_preedit.is_empty() {
-                        let text = std::mem::take(&mut this.ime_preedit);
-                        this.terminal.input(text.as_bytes());
+                    if Self::dispatch_mapped_keystroke(
+                        &mut this.terminal,
+                        mapped,
+                        &mut this.ime_preedit,
+                    ) {
+                        cx.stop_propagation();
                     }
-                    this.terminal
-                        .try_keystroke(key, mods, utf8.as_deref(), unshifted);
                 }
             }))
             .on_scroll_wheel(cx.listener(|this, event: &ScrollWheelEvent, _window, cx| {
