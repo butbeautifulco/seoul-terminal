@@ -294,7 +294,7 @@ impl DaemonClient {
     }
 
     fn connect_or_spawn_inner() -> Result<Self> {
-        let socket_path = paths::socket_path();
+        let socket_path = paths::socket_path()?;
 
         // Try to connect to existing daemon
         if let Ok(stream) = UnixStream::connect(&socket_path) {
@@ -309,7 +309,7 @@ impl DaemonClient {
 
     /// Wait for daemon socket to appear, then connect (exponential backoff, max 3s).
     fn wait_and_connect() -> Result<Self> {
-        let socket_path = paths::socket_path();
+        let socket_path = paths::socket_path()?;
         let mut wait_ms = 10;
         let mut total_waited = 0;
         while total_waited < 3000 {
@@ -361,7 +361,7 @@ impl DaemonClient {
 
         // Auth handshake BEFORE starting reader thread (sequential reads are safe here)
         {
-            let token = std::fs::read_to_string(paths::token_path())
+            let token = std::fs::read_to_string(paths::token_path()?)
                 .context("failed to read daemon token")?;
 
             let hello = HelloMsg {
