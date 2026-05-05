@@ -1,0 +1,67 @@
+{
+  "$schema": "https://docs.renovatebot.com/renovate-schema.json",
+  "extends": [
+    "config:recommended",
+    "helpers:pinGitHubActionDigests",
+    ":semanticCommits",
+    ":semanticCommitTypeAll(chore)",
+    ":dependencyDashboard",
+    ":prHourlyLimit2",
+    ":prConcurrentLimit5",
+    ":timezone(Asia/Seoul)"
+  ],
+  "schedule": ["before 9am on monday"],
+  "labels": ["dependencies"],
+  "rangeStrategy": "bump",
+  "rebaseWhen": "conflicted",
+  "lockFileMaintenance": {
+    "enabled": true,
+    "schedule": ["before 9am on monday"],
+    "commitMessageAction": "Refresh"
+  },
+  "cargo": {
+    "commitMessageTopic": "Rust crate {{depName}}"
+  },
+  "packageRules": [
+    {
+      "description": "Group cargo minor + patch updates into a single PR",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["minor", "patch"],
+      "groupName": "cargo non-major",
+      "groupSlug": "cargo-non-major"
+    },
+    {
+      "description": "Cargo major updates: separate PR per crate, require manual review",
+      "matchManagers": ["cargo"],
+      "matchUpdateTypes": ["major"],
+      "labels": ["dependencies", "breaking"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "Disable updates for git-pinned deps managed manually against zed/ghostty",
+      "matchPackageNames": ["gpui", "libghostty-vt"],
+      "enabled": false
+    },
+    {
+      "description": "Pre-1.0 crates: pin minor (treat as breaking)",
+      "matchManagers": ["cargo"],
+      "matchCurrentVersion": "/^0\\./",
+      "matchUpdateTypes": ["minor"],
+      "labels": ["dependencies", "breaking"],
+      "groupName": "cargo 0.x minor (breaking)"
+    },
+    {
+      "description": "Cool-down period to dodge yanked releases",
+      "matchManagers": ["cargo"],
+      "minimumReleaseAge": "3 days"
+    },
+    {
+      "description": "GitHub Actions: pin to commit SHA, group all bumps, keep version comment in sync",
+      "matchManagers": ["github-actions"],
+      "pinDigests": true,
+      "groupName": "github-actions",
+      "groupSlug": "github-actions",
+      "minimumReleaseAge": "3 days"
+    }
+  ]
+}
