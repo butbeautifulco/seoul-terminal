@@ -80,7 +80,7 @@ mod tests {
         };
 
         assert!(cache.get(path).is_none());
-        cache.set(path, status.clone());
+        cache.set(path, status);
         assert_eq!(cache.get(path).unwrap().branch, "main");
     }
 

@@ -30,7 +30,7 @@ test:
 
 # Lint
 lint:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets --locked -- -D warnings
 
 # Kill running daemon (SIGKILL to avoid graceful shutdown delay, clean up all runtime files)
 kill-daemon:
