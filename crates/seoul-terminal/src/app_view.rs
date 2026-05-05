@@ -166,6 +166,7 @@ actions!(
 
 use crate::pane::{Pane, PaneEvent, TabMetadata};
 use crate::pane_group::{Axis, PaneGroup};
+use crate::tab_kind::TabKind;
 
 // ---------------------------------------------------------------------------
 // AppView
@@ -1037,7 +1038,7 @@ impl AppView {
         let pane = self.get_or_create_pane(ws_id, cx);
 
         // Check if Settings tab already exists — activate it
-        if let Some(tab_id) = pane.read(cx).find_tab_by_kind("settings") {
+        if let Some(tab_id) = pane.read(cx).find_tab_by_kind(TabKind::Settings) {
             pane.update(cx, |p, cx| p.activate_item(tab_id, _window, cx));
             return;
         }
@@ -1066,7 +1067,7 @@ impl AppView {
             p.add_item(
                 tab_id,
                 Box::new(settings_view),
-                TabMetadata::new("settings", None, Some(PersistedTabKind::Settings)),
+                TabMetadata::new(TabKind::Settings, None, Some(PersistedTabKind::Settings)),
                 _window,
                 cx,
             );
@@ -1153,7 +1154,7 @@ impl AppView {
                         tab.id,
                         Box::new(terminal),
                         TabMetadata::new(
-                            "terminal",
+                            TabKind::Terminal,
                             None,
                             Some(PersistedTabKind::Terminal { session_id }),
                         ),
@@ -1170,7 +1171,7 @@ impl AppView {
                         tab.id,
                         Box::new(editor),
                         TabMetadata::new(
-                            "editor",
+                            TabKind::Editor,
                             Some(path.clone()),
                             Some(PersistedTabKind::Editor { path }),
                         ),
@@ -1186,7 +1187,7 @@ impl AppView {
                     p.add_item(
                         tab.id,
                         Box::new(settings_view),
-                        TabMetadata::new("settings", None, Some(PersistedTabKind::Settings)),
+                        TabMetadata::new(TabKind::Settings, None, Some(PersistedTabKind::Settings)),
                         window,
                         cx,
                     );
@@ -1204,7 +1205,7 @@ impl AppView {
                         tab.id,
                         Box::new(diff_view),
                         TabMetadata::new(
-                            "diff",
+                            TabKind::Diff,
                             None,
                             Some(PersistedTabKind::Diff { path, category }),
                         ),
@@ -1269,7 +1270,7 @@ impl AppView {
                     tab_id,
                     Box::new(terminal),
                     TabMetadata::new(
-                        "terminal",
+                        TabKind::Terminal,
                         None,
                         Some(PersistedTabKind::Terminal { session_id }),
                     ),
@@ -1397,7 +1398,7 @@ impl AppView {
                 tab_id,
                 Box::new(terminal),
                 TabMetadata::new(
-                    "terminal",
+                    TabKind::Terminal,
                     None,
                     Some(PersistedTabKind::Terminal { session_id }),
                 ),
@@ -1416,9 +1417,9 @@ impl AppView {
 
     fn on_pane_event(&mut self, _pane: Entity<Pane>, event: &PaneEvent, cx: &mut Context<Self>) {
         match event {
-            PaneEvent::CloseItem { tab_id, kind_id } => {
+            PaneEvent::CloseItem { tab_id, kind } => {
                 // For terminal tabs: kill daemon session immediately
-                if *kind_id == "terminal" {
+                if *kind == TabKind::Terminal {
                     self.terminal_tabs.remove(tab_id);
                     self.pending_attach_tabs.remove(tab_id);
                     if let Some(session_id) = self.tab_sessions.remove(tab_id) {
@@ -1543,7 +1544,7 @@ impl AppView {
                 tab_id,
                 Box::new(terminal),
                 TabMetadata::new(
-                    "terminal",
+                    TabKind::Terminal,
                     None,
                     Some(PersistedTabKind::Terminal { session_id }),
                 ),
@@ -1611,7 +1612,7 @@ impl AppView {
                 entry.tab_id,
                 Box::new(terminal),
                 TabMetadata::new(
-                    "terminal",
+                    TabKind::Terminal,
                     None,
                     Some(PersistedTabKind::Terminal { session_id }),
                 ),
@@ -1961,7 +1962,7 @@ impl AppView {
         let pane = self.get_or_create_pane(ws_id, cx);
 
         // Check if already open — activate existing tab
-        if let Some(tab_id) = pane.read(cx).find_tab_by_path("editor", &path) {
+        if let Some(tab_id) = pane.read(cx).find_tab_by_path(TabKind::Editor, &path) {
             // open_file_from_tree has no Window — just set active, let next render pick it up
             pane.update(cx, |p, _cx| {
                 p.active_tab_id = Some(tab_id);
@@ -1980,7 +1981,7 @@ impl AppView {
                 tab_id,
                 Box::new(editor),
                 TabMetadata::new(
-                    "editor",
+                    TabKind::Editor,
                     Some(path.clone()),
                     Some(PersistedTabKind::Editor { path }),
                 ),
@@ -2127,7 +2128,7 @@ impl AppView {
                 tab_id,
                 Box::new(diff_view),
                 TabMetadata::new(
-                    "diff",
+                    TabKind::Diff,
                     None,
                     Some(PersistedTabKind::Diff { path, category }),
                 ),

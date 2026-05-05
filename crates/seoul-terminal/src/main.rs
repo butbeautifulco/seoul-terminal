@@ -17,6 +17,7 @@ mod process_metrics;
 mod resource_indicator;
 mod settings_view;
 mod syntax;
+mod tab_kind;
 mod terminal_element;
 mod terminal_view;
 mod text_input;

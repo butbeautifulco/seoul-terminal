@@ -93,8 +93,8 @@ impl crate::item::Item for SettingsView {
         "Settings".into()
     }
 
-    fn tab_kind_id(&self) -> &'static str {
-        "settings"
+    fn tab_kind(&self) -> crate::tab_kind::TabKind {
+        crate::tab_kind::TabKind::Settings
     }
 }
 

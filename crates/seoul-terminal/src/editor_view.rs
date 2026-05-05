@@ -1004,8 +1004,8 @@ impl crate::item::Item for EditorView {
         }
     }
 
-    fn tab_kind_id(&self) -> &'static str {
-        "editor"
+    fn tab_kind(&self) -> crate::tab_kind::TabKind {
+        crate::tab_kind::TabKind::Editor
     }
 
     fn is_dirty(&self) -> bool {

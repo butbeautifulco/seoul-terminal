@@ -1281,8 +1281,8 @@ impl crate::item::Item for TerminalView {
         "Terminal".into()
     }
 
-    fn tab_kind_id(&self) -> &'static str {
-        "terminal"
+    fn tab_kind(&self) -> crate::tab_kind::TabKind {
+        crate::tab_kind::TabKind::Terminal
     }
 }
 

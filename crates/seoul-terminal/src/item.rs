@@ -1,6 +1,8 @@
 #![allow(dead_code)]
 use gpui::*;
 
+use crate::tab_kind::TabKind;
+
 // ---------------------------------------------------------------------------
 // Item trait — implemented by each tab content type
 // ---------------------------------------------------------------------------
@@ -11,8 +13,8 @@ pub trait Item: Focusable + Render + 'static {
     /// Title shown in the tab bar.
     fn tab_title(&self, cx: &App) -> String;
 
-    /// A string identifier for the tab kind, used for serialization.
-    fn tab_kind_id(&self) -> &'static str;
+    /// The kind of this tab, used for serialization and tab routing.
+    fn tab_kind(&self) -> TabKind;
 
     /// Whether this item has unsaved changes.
     fn is_dirty(&self) -> bool {
@@ -33,7 +35,7 @@ pub trait Item: Focusable + Render + 'static {
 /// Stored in collections where the concrete type is not known.
 pub trait ItemHandle: 'static {
     fn tab_title(&self, cx: &App) -> String;
-    fn tab_kind_id(&self, cx: &App) -> &'static str;
+    fn tab_kind(&self, cx: &App) -> TabKind;
     fn is_dirty(&self, cx: &App) -> bool;
     fn can_save(&self, cx: &App) -> bool;
     fn focus_handle(&self, cx: &App) -> FocusHandle;
@@ -45,8 +47,8 @@ impl<T: Item> ItemHandle for Entity<T> {
         self.read(cx).tab_title(cx)
     }
 
-    fn tab_kind_id(&self, cx: &App) -> &'static str {
-        self.read(cx).tab_kind_id()
+    fn tab_kind(&self, cx: &App) -> TabKind {
+        self.read(cx).tab_kind()
     }
 
     fn is_dirty(&self, cx: &App) -> bool {
