@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 
 use anyhow::Result;
-use tokio::sync::mpsc;
 use tracing::{debug, info};
 use uuid::Uuid;
 
@@ -9,7 +8,7 @@ use seoul_terminal_proto::messages::*;
 use seoul_terminal_proto::session::{SessionId, SessionStatus};
 
 use crate::resource_monitor::{ResourceMonitor, SessionInfo};
-use crate::session::{self, ClientEvent, ClientHandle, DaemonSession, SessionWriteHandle};
+use crate::session::{ClientEvent, ClientHandle, DaemonSession, SessionWriteHandle};
 
 /// Result of the fast (lock-held) phase of create_or_attach.
 pub enum AttachResult {
@@ -34,21 +33,20 @@ pub enum EnsureResult {
 }
 
 /// Central manager of all terminal sessions.
+///
+/// Each `DaemonSession` owns its own bounded event channel back to this host
+/// (`event_rx`), so a single backed-up consumer can't head-of-line-block
+/// other sessions' PTY readers. The shared mpsc previously used here was
+/// the source of cross-session interference under heavy output bursts.
 pub struct TerminalHost {
     sessions: HashMap<SessionId, DaemonSession>,
-    /// Channel for PTY reader tasks to send data back to the host.
-    broadcast_tx: mpsc::Sender<(SessionId, ClientEvent)>,
-    broadcast_rx: mpsc::Receiver<(SessionId, ClientEvent)>,
     resource_monitor: ResourceMonitor,
 }
 
 impl TerminalHost {
     pub fn new() -> Self {
-        let (broadcast_tx, broadcast_rx) = mpsc::channel(session::BROADCAST_CHANNEL_CAPACITY);
         Self {
             sessions: HashMap::new(),
-            broadcast_tx,
-            broadcast_rx,
             resource_monitor: ResourceMonitor::new(),
         }
     }
@@ -117,7 +115,6 @@ impl TerminalHost {
             msg.rows,
             msg.cwd,
             msg.shell,
-            self.broadcast_tx.clone(),
         )?;
 
         // Cold restore: the client's ghostty will generate fresh terminal query
@@ -149,7 +146,6 @@ impl TerminalHost {
             msg.rows,
             msg.cwd,
             msg.shell,
-            self.broadcast_tx.clone(),
         )?;
 
         let ensured = SessionEnsuredMsg {
@@ -244,27 +240,34 @@ impl TerminalHost {
     }
 
     /// Process pending PTY output events. Call this in the main loop.
+    ///
+    /// Walks every session and drains its per-session event queue. We
+    /// collect events into a local buffer first so we can release the
+    /// `&mut session.event_rx` borrow before calling `&mut session`
+    /// methods like `on_pty_data` / `on_exit`.
     pub fn drain_broadcast(&mut self) {
-        while let Ok((session_id, event)) = self.broadcast_rx.try_recv() {
-            match event {
-                ClientEvent::Data(data_msg) => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
-                        session.on_pty_data(data_msg.data);
-                    }
-                }
-                ClientEvent::Exit(exit_msg) => {
-                    if let Some(session) = self.sessions.get_mut(&session_id) {
+        for session in self.sessions.values_mut() {
+            // Pull all pending events for this session up front. Bounded by
+            // SESSION_EVENT_CHANNEL_CAPACITY so this can't grow unbounded.
+            let mut events: Vec<ClientEvent> = Vec::new();
+            while let Ok(event) = session.event_rx.try_recv() {
+                events.push(event);
+            }
+            for event in events {
+                match event {
+                    ClientEvent::Data(data_msg) => session.on_pty_data(data_msg.data),
+                    ClientEvent::Exit(exit_msg) => {
                         let code = match exit_msg.status {
                             SessionStatus::Exited { code } => code,
                             _ => 0,
                         };
                         session.on_exit(code);
                     }
+                    // PR status events flow directly from PrPoller → client
+                    // writers and don't pass through per-session channels;
+                    // if one ends up here it's a routing bug — drop it.
+                    ClientEvent::PrStatusUpdated(_) | ClientEvent::PrStatusUnavailable(_) => {}
                 }
-                // PR status events flow directly from PrPoller → client writers
-                // and don't pass through the host's broadcast channel; if one
-                // ends up here it's a routing bug — drop it silently.
-                ClientEvent::PrStatusUpdated(_) | ClientEvent::PrStatusUnavailable(_) => {}
             }
         }
     }
