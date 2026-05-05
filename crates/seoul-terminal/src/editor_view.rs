@@ -744,40 +744,48 @@ impl EditorView {
         self.desired_col = None;
     }
 
-    fn move_up(&mut self, _: &MoveUp, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor.row == 0 {
+    /// Vertical cursor movement with optional selection extension.
+    ///
+    /// `dir` must be -1 (up) or +1 (down). `extend = true` extends the
+    /// current selection (matching `select_up`/`select_down`); `extend
+    /// = false` collapses the selection (matching `move_up`/`move_down`).
+    ///
+    /// Boundary semantics match the legacy four-fn implementation:
+    ///   - non-extending move at row 0 going up: snap to (0, 0).
+    ///   - non-extending move at last row going down: snap to EOL.
+    ///   - extending move at either boundary: no-op (anchor unchanged).
+    fn vertical_move(&mut self, dir: i32, extend: bool, cx: &mut Context<Self>) {
+        debug_assert!(dir == -1 || dir == 1);
+        let cur = self.cursor;
+        let line_count = self.buffer.line_count();
+
+        if dir < 0 && cur.row == 0 {
+            if extend {
+                return;
+            }
             self.move_cursor(CursorPosition { row: 0, col: 0 }, false, cx);
+            self.desired_col = None;
             return;
         }
-        let col = self.desired_col.unwrap_or(self.cursor.col);
-        let new_row = self.cursor.row - 1;
-        let max_col = self.buffer.line_len_bytes(new_row);
-        self.desired_col = Some(col);
-        self.move_cursor(
-            CursorPosition {
-                row: new_row,
-                col: col.min(max_col),
-            },
-            false,
-            cx,
-        );
-    }
-
-    fn move_down(&mut self, _: &MoveDown, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor.row + 1 >= self.buffer.line_count() {
-            let last_col = self.buffer.line_len_bytes(self.cursor.row);
+        if dir > 0 && cur.row + 1 >= line_count {
+            if extend {
+                return;
+            }
+            let last_col = self.buffer.line_len_bytes(cur.row);
             self.move_cursor(
                 CursorPosition {
-                    row: self.cursor.row,
+                    row: cur.row,
                     col: last_col,
                 },
                 false,
                 cx,
             );
+            self.desired_col = None;
             return;
         }
-        let col = self.desired_col.unwrap_or(self.cursor.col);
-        let new_row = self.cursor.row + 1;
+
+        let new_row = (cur.row as i32 + dir) as usize;
+        let col = self.desired_col.unwrap_or(cur.col);
         let max_col = self.buffer.line_len_bytes(new_row);
         self.desired_col = Some(col);
         self.move_cursor(
@@ -785,9 +793,17 @@ impl EditorView {
                 row: new_row,
                 col: col.min(max_col),
             },
-            false,
+            extend,
             cx,
         );
+    }
+
+    fn move_up(&mut self, _: &MoveUp, _window: &mut Window, cx: &mut Context<Self>) {
+        self.vertical_move(-1, false, cx);
+    }
+
+    fn move_down(&mut self, _: &MoveDown, _window: &mut Window, cx: &mut Context<Self>) {
+        self.vertical_move(1, false, cx);
     }
 
     fn move_to_line_start(
@@ -838,39 +854,11 @@ impl EditorView {
     }
 
     fn select_up(&mut self, _: &SelectUp, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor.row == 0 {
-            return;
-        }
-        let col = self.desired_col.unwrap_or(self.cursor.col);
-        let new_row = self.cursor.row - 1;
-        let max_col = self.buffer.line_len_bytes(new_row);
-        self.desired_col = Some(col);
-        self.move_cursor(
-            CursorPosition {
-                row: new_row,
-                col: col.min(max_col),
-            },
-            true,
-            cx,
-        );
+        self.vertical_move(-1, true, cx);
     }
 
     fn select_down(&mut self, _: &SelectDown, _window: &mut Window, cx: &mut Context<Self>) {
-        if self.cursor.row + 1 >= self.buffer.line_count() {
-            return;
-        }
-        let col = self.desired_col.unwrap_or(self.cursor.col);
-        let new_row = self.cursor.row + 1;
-        let max_col = self.buffer.line_len_bytes(new_row);
-        self.desired_col = Some(col);
-        self.move_cursor(
-            CursorPosition {
-                row: new_row,
-                col: col.min(max_col),
-            },
-            true,
-            cx,
-        );
+        self.vertical_move(1, true, cx);
     }
 
     fn move_word_left(&mut self, _: &MoveWordLeft, _window: &mut Window, cx: &mut Context<Self>) {
@@ -1387,6 +1375,101 @@ mod tests {
         let mut cache = RenderCache::default();
         cache.update(BufferVersion(1), 0..20, ScrollOffset(0));
         assert!(!cache.is_fresh(BufferVersion(1), 5..25, ScrollOffset(0)));
+    }
+
+    /// Write `contents` to a fresh temp file and return its path. The
+    /// caller is responsible for `remove_file` cleanup.
+    #[cfg(test)]
+    fn write_temp_file(contents: &str) -> std::path::PathBuf {
+        let tmp = std::env::temp_dir().join(format!(
+            "seoul-editor-vmove-{}-{}.rs",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&tmp, contents).unwrap();
+        tmp
+    }
+
+    #[::core::prelude::v1::test]
+    fn vertical_move_down_then_up_collapses_selection() {
+        let tmp = write_temp_file("line0\nline1\nline2\nline3\nline4\n");
+        let mut app = gpui::TestAppContext::single();
+        let cx = app.add_empty_window();
+        let path = tmp.clone();
+        let editor = cx.update(|_, cx| {
+            cx.set_global(seoul_workspace::settings::SettingsStore::for_test());
+            cx.new(|cx| EditorView::new(cx, path))
+        });
+        editor.update(cx, |view, _| view.load_now_for_test());
+
+        // Move down 3 rows (0 → 3) then up 2 (3 → 1).
+        editor.update(cx, |view, cx| {
+            view.vertical_move(1, false, cx);
+            view.vertical_move(1, false, cx);
+            view.vertical_move(1, false, cx);
+            assert_eq!(view.cursor.row, 3);
+            view.vertical_move(-1, false, cx);
+            view.vertical_move(-1, false, cx);
+            assert_eq!(view.cursor.row, 1);
+            assert!(
+                view.selection_anchor.is_none(),
+                "non-extending vertical_move should leave selection_anchor None"
+            );
+        });
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[::core::prelude::v1::test]
+    fn vertical_move_extend_keeps_anchor() {
+        let tmp = write_temp_file("a\nb\nc\nd\n");
+        let mut app = gpui::TestAppContext::single();
+        let cx = app.add_empty_window();
+        let path = tmp.clone();
+        let editor = cx.update(|_, cx| {
+            cx.set_global(seoul_workspace::settings::SettingsStore::for_test());
+            cx.new(|cx| EditorView::new(cx, path))
+        });
+        editor.update(cx, |view, _| view.load_now_for_test());
+
+        editor.update(cx, |view, cx| {
+            view.vertical_move(1, true, cx);
+            view.vertical_move(1, true, cx);
+            assert_eq!(view.cursor.row, 2);
+            // Anchor should be set to the original cursor position.
+            assert_eq!(
+                view.selection_anchor,
+                Some(CursorPosition { row: 0, col: 0 }),
+                "extending vertical_move should anchor at the start position"
+            );
+        });
+
+        let _ = std::fs::remove_file(&tmp);
+    }
+
+    #[::core::prelude::v1::test]
+    fn vertical_move_up_at_row_zero_snaps_to_origin() {
+        let tmp = write_temp_file("hello\nworld\n");
+        let mut app = gpui::TestAppContext::single();
+        let cx = app.add_empty_window();
+        let path = tmp.clone();
+        let editor = cx.update(|_, cx| {
+            cx.set_global(seoul_workspace::settings::SettingsStore::for_test());
+            cx.new(|cx| EditorView::new(cx, path))
+        });
+        editor.update(cx, |view, _| view.load_now_for_test());
+
+        editor.update(cx, |view, cx| {
+            // Place cursor at (0, 3) then move up — should snap to (0, 0).
+            view.cursor = CursorPosition { row: 0, col: 3 };
+            view.vertical_move(-1, false, cx);
+            assert_eq!(view.cursor, CursorPosition { row: 0, col: 0 });
+        });
+
+        let _ = std::fs::remove_file(&tmp);
     }
 
     #[::core::prelude::v1::test]
