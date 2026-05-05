@@ -60,16 +60,11 @@ impl EventEmitter<EditorEvent> for EditorView {}
 /// previous epoch — when its callback finally fires, `should_tick`
 /// returns `false` and the callback no-ops. This is the same pattern
 /// used by `terminal_view.rs` (see `bump_blink_epoch`/`tick_blink`).
-//
-// Allowed-dead in WT1.1 because the legacy `tick` loop hasn't been
-// replaced yet; WT1.2 wires it into `show_cursor_now`/`tick_blink`.
 #[derive(Default)]
-#[allow(dead_code)]
 struct BlinkState {
     epoch: u64,
 }
 
-#[allow(dead_code)]
 impl BlinkState {
     fn bump(&mut self) -> u64 {
         self.epoch += 1;
@@ -107,14 +102,11 @@ pub struct EditorView {
     highlighter: SyntaxHighlighter,
     // Element bounds (captured during render for mouse hit-testing)
     element_bounds: Rc<Cell<Option<Bounds<Pixels>>>>,
-    // Cursor blink
+    // Cursor blink — see `show_cursor_now` and `tick_blink`.
+    // `blink` epoch discriminates current vs. stale timer callbacks.
     cursor_blink_visible: bool,
     last_edit_epoch: std::time::Instant,
     last_blink_toggle: std::time::Instant,
-    blink_loop_started: bool,
-    // Used by show_cursor_now / tick_blink in WT1.2; the legacy `tick`
-    // bootstrap still drives blinking until that swap lands.
-    #[allow(dead_code)]
     blink: BlinkState,
 }
 
@@ -142,7 +134,7 @@ impl EditorView {
         })
         .detach();
 
-        Self {
+        let mut this = Self {
             file_path,
             buffer,
             dirty: false,
@@ -163,9 +155,12 @@ impl EditorView {
             cursor_blink_visible: true,
             last_edit_epoch: std::time::Instant::now(),
             last_blink_toggle: std::time::Instant::now(),
-            blink_loop_started: false,
             blink: BlinkState::default(),
-        }
+        };
+        // Bootstrap the blink cycle: pauses for BLINK_PAUSE so the first
+        // toggle fires at +BLINK_PAUSE, matching activity-driven behavior.
+        this.show_cursor_now(cx);
+        this
     }
 
     fn compute_gutter_width(line_count: usize) -> f32 {
@@ -188,9 +183,7 @@ impl EditorView {
             self.dirty = true;
             cx.emit(EditorEvent::DirtyChanged { is_dirty: true });
         }
-        self.last_edit_epoch = std::time::Instant::now();
-        self.last_blink_toggle = self.last_edit_epoch;
-        self.cursor_blink_visible = true;
+        self.show_cursor_now(cx);
     }
 
     fn mark_clean(&mut self, cx: &mut Context<Self>) {
@@ -200,30 +193,63 @@ impl EditorView {
         }
     }
 
-    fn tick(&mut self, window: &mut Window, cx: &mut Context<Self>) {
-        let now = std::time::Instant::now();
-        let since_input = now.duration_since(self.last_edit_epoch);
-        let mut needs_repaint = false;
+    /// Cursor blink half-period: cursor toggles every BLINK_INTERVAL.
+    const BLINK_INTERVAL: std::time::Duration = std::time::Duration::from_millis(500);
 
-        if since_input.as_millis() < 500 {
-            if !self.cursor_blink_visible {
-                self.cursor_blink_visible = true;
-                self.last_blink_toggle = now;
-                needs_repaint = true;
-            }
-        } else if now.duration_since(self.last_blink_toggle).as_millis() >= 500 {
-            self.cursor_blink_visible = !self.cursor_blink_visible;
-            self.last_blink_toggle = now;
-            needs_repaint = true;
-        }
+    /// Pause blinking for this duration after user-perceptible activity
+    /// (keystroke, scroll, IME). Cursor stays visible during the pause;
+    /// the next toggle fires once the pause window has elapsed.
+    const BLINK_PAUSE: std::time::Duration = std::time::Duration::from_millis(500);
 
-        if needs_repaint {
+    /// Show the cursor immediately and start a fresh blink cycle.
+    ///
+    /// Called from any user-perceptible activity: keystrokes, edits,
+    /// scroll, IME composition, mouse selection. Bumps the blink epoch
+    /// so any in-flight timer becomes stale and no-ops on its callback,
+    /// then schedules a fresh blink cycle to start after `BLINK_PAUSE`.
+    ///
+    /// Detached tasks are safe here: the epoch counter discriminates
+    /// stale callbacks, and view drop turns `upgrade()` into None.
+    fn show_cursor_now(&mut self, cx: &mut Context<Self>) {
+        if !self.cursor_blink_visible {
+            self.cursor_blink_visible = true;
             cx.notify();
         }
+        self.last_edit_epoch = std::time::Instant::now();
+        self.last_blink_toggle = self.last_edit_epoch;
+        let epoch = self.blink.bump();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Self::BLINK_PAUSE).await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.tick_blink(epoch, cx));
+            }
+        })
+        .detach();
+    }
 
-        cx.on_next_frame(window, |this, window, cx| {
-            this.tick(window, cx);
-        });
+    /// Toggle cursor visibility and reschedule the next toggle.
+    ///
+    /// `epoch` is the epoch this callback was scheduled with; if the
+    /// view's current epoch has advanced (e.g. another `show_cursor_now`
+    /// fired in the meantime), this callback is stale and exits.
+    fn tick_blink(&mut self, epoch: u64, cx: &mut Context<Self>) {
+        if !self.blink.should_tick(epoch) {
+            return;
+        }
+        if self.last_edit_epoch.elapsed() < Self::BLINK_PAUSE {
+            return;
+        }
+        self.cursor_blink_visible = !self.cursor_blink_visible;
+        self.last_blink_toggle = std::time::Instant::now();
+        cx.notify();
+        let next = self.blink.bump();
+        cx.spawn(async move |this, cx| {
+            cx.background_executor().timer(Self::BLINK_INTERVAL).await;
+            if let Some(this) = this.upgrade() {
+                this.update(cx, |this, cx| this.tick_blink(next, cx));
+            }
+        })
+        .detach();
     }
 
     // -- Selection helpers --
@@ -311,9 +337,7 @@ impl EditorView {
             self.selection_anchor = None;
         }
         self.cursor = clamped;
-        self.last_edit_epoch = std::time::Instant::now();
-        self.last_blink_toggle = self.last_edit_epoch;
-        self.cursor_blink_visible = true;
+        self.show_cursor_now(cx);
         self.ensure_cursor_visible();
         cx.notify();
     }
@@ -959,6 +983,7 @@ impl EntityInputHandler for EditorView {
         self.selection_anchor = None;
 
         self.reparse_sync();
+        self.show_cursor_now(cx);
         cx.notify();
     }
 
@@ -1060,14 +1085,7 @@ impl Focusable for EditorView {
 // -- Render --
 
 impl Render for EditorView {
-    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        if !self.blink_loop_started {
-            self.blink_loop_started = true;
-            cx.on_next_frame(window, |this, window, cx| {
-                this.tick(window, cx);
-            });
-        }
-
+    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         // Build snapshot data for rendering (Zed snapshot pattern — avoid borrow conflicts)
         let line_count = self.buffer.line_count();
         let cursor = self.cursor;
