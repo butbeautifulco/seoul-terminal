@@ -305,6 +305,20 @@ impl SettingsStore {
         cx.set_global(store);
     }
 
+    /// Construct a settings store backed only by `Settings::default()` —
+    /// no filesystem access, no projects, no on-disk skeleton write.
+    /// Use from unit tests that need a `SettingsStore` global without
+    /// touching the user's real settings file.
+    pub fn for_test() -> Self {
+        Self {
+            user_content: SettingsContent::default(),
+            project_settings: HashMap::new(),
+            global_resolved: Settings::default(),
+            project_resolved: HashMap::new(),
+            user_last_modified: None,
+        }
+    }
+
     /// Global settings (no project context).
     pub fn global(&self) -> &Settings {
         &self.global_resolved
