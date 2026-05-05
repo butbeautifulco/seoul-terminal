@@ -37,7 +37,7 @@ unicode-segmentation.workspace = true
 streaming-iterator.workspace = true
 uuid.workspace = true
 dirs.workspace = true
-notify = { version = "7", default-features = false, features = ["macos_kqueue"] }
+notify = { version = "8", default-features = false, features = ["macos_fsevent"] }
 ropey.workspace = true
 tree-sitter.workspace = true
 tree-sitter-language.workspace = true

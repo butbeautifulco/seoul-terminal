@@ -517,3 +517,37 @@ fn format_error(op: &str, err: &anyhow::Error) -> String {
     }
     format!("{op} 실패: {err_str}")
 }
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use notify::{RecommendedWatcher, RecursiveMode, Watcher};
+
+    #[test]
+    fn recommended_git_watcher_uses_fsevents_on_macos() {
+        assert_eq!(
+            <RecommendedWatcher as Watcher>::kind(),
+            notify::WatcherKind::Fsevent
+        );
+    }
+
+    #[test]
+    fn dropping_recommended_git_watcher_does_not_panic_on_macos() {
+        let watch_dir =
+            std::env::temp_dir().join(format!("seoul-notify-drop-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir(&watch_dir).expect("create temp watch directory");
+
+        let result = std::panic::catch_unwind(|| {
+            let mut watcher = notify::recommended_watcher(
+                |_: std::result::Result<notify::Event, notify::Error>| {},
+            )
+            .expect("create watcher");
+            watcher
+                .watch(&watch_dir, RecursiveMode::NonRecursive)
+                .expect("watch temp directory");
+            drop(watcher);
+        });
+
+        let _ = std::fs::remove_dir(&watch_dir);
+        assert!(result.is_ok(), "dropping watcher panicked");
+    }
+}
