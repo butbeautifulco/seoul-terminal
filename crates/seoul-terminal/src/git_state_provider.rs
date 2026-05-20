@@ -90,6 +90,14 @@ impl GitStateProvider {
         self.is_busy
     }
 
+    pub fn set_default_branch(&mut self, default_branch: String, cx: &mut Context<Self>) {
+        if self.default_branch == default_branch {
+            return;
+        }
+        self.default_branch = default_branch;
+        self.invalidate_and_refresh(cx);
+    }
+
     /// Get a map of relative paths to their git status, for file tree decorations.
     pub fn file_status_map(&self) -> HashMap<String, FileStatus> {
         let mut map = HashMap::new();

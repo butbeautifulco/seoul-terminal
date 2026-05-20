@@ -12,6 +12,7 @@ use crate::git;
 use crate::git::GitCommandRunner;
 use crate::project::Project;
 use crate::seoul_dong::SEOUL_DONG;
+use crate::settings::BranchPrefixMode;
 use crate::worktree;
 
 /// Discriminates "main repo, no worktree" workspaces from feature-branch worktrees.
@@ -43,15 +44,24 @@ impl Workspace {
     /// The worktree is placed at `~/.seoul/worktrees/{project_name}/{workspace_name}`.
     /// `branch_name` can differ from `name` if the user provides a custom branch.
     pub fn create(project: &Project, name: &str, branch_name: &str) -> Result<Self> {
-        let base_dir = worktree_base_dir()?;
+        Self::create_with_options(project, name, branch_name, None, &project.default_branch)
+    }
+
+    pub fn create_with_options(
+        project: &Project,
+        name: &str,
+        branch_name: &str,
+        configured_base_dir: Option<&Path>,
+        default_branch: &str,
+    ) -> Result<Self> {
+        let base_dir = match configured_base_dir {
+            Some(path) if path.is_absolute() => path.to_path_buf(),
+            Some(path) => project.path.join(path),
+            None => worktree_base_dir()?,
+        };
         let target_path = base_dir.join(&project.name).join(name);
 
-        worktree::create_worktree(
-            &project.path,
-            branch_name,
-            &project.default_branch,
-            &target_path,
-        )?;
+        worktree::create_worktree(&project.path, branch_name, default_branch, &target_path)?;
 
         Ok(Self {
             id: Uuid::new_v4(),
@@ -159,6 +169,30 @@ const MAX_AUTHOR_PREFIX_LEN: usize = 50;
 /// suffix. Comparison against `existing_names` is case-insensitive.
 pub fn generate_workspace_name(repo_path: &Path, existing_names: &[String]) -> String {
     let prefix = resolve_author_prefix(repo_path);
+    generate_with_prefix(prefix.as_deref(), existing_names)
+}
+
+pub fn generate_workspace_name_with_options(
+    repo_path: &Path,
+    existing_names: &[String],
+    branch_prefix_mode: BranchPrefixMode,
+    branch_prefix_custom: &str,
+) -> String {
+    let prefix = match branch_prefix_mode {
+        BranchPrefixMode::Github => github_login(repo_path).and_then(|login| {
+            let slug = sanitize_author_prefix(&login);
+            (!slug.is_empty()).then_some(slug)
+        }),
+        BranchPrefixMode::Author => git_config_user_name(repo_path).and_then(|name| {
+            let slug = sanitize_author_prefix(&name);
+            (!slug.is_empty()).then_some(slug)
+        }),
+        BranchPrefixMode::Custom => {
+            let slug = sanitize_author_prefix(branch_prefix_custom);
+            (!slug.is_empty()).then_some(slug)
+        }
+        BranchPrefixMode::None => None,
+    };
     generate_with_prefix(prefix.as_deref(), existing_names)
 }
 

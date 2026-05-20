@@ -41,6 +41,18 @@ const LEFT_SIDEBAR_MAX: f32 = 480.0;
 const RIGHT_SIDEBAR_MIN: f32 = 200.0;
 const RIGHT_SIDEBAR_MAX: f32 = 600.0;
 
+fn file_tree_settings_for_project(project_id: Option<Uuid>, cx: &App) -> (bool, Vec<String>) {
+    let store = cx.global::<SettingsStore>();
+    let file_tree = project_id
+        .and_then(|id| store.project_settings(id))
+        .map(|settings| &settings.file_tree)
+        .unwrap_or(&store.global().project.file_tree);
+    (
+        file_tree.respect_gitignore,
+        file_tree.extra_excludes.clone(),
+    )
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RestorePlanMode {
     Attach,
@@ -253,8 +265,14 @@ impl AppView {
         let root = state
             .active_workspace()
             .and_then(|ws| state.workspace_working_dir(ws));
-        let file_tree = cx.new(|cx| FileTreeView::new(cx, root));
+        let active_project_id = state.active_workspace().map(|ws| ws.project_id);
+        let (respect_gitignore, extra_excludes) =
+            file_tree_settings_for_project(active_project_id, cx);
+        let file_tree = cx.new(|cx| FileTreeView::new(cx, root, respect_gitignore, extra_excludes));
         let file_tree_sub = cx.subscribe(&file_tree, Self::on_file_tree_event);
+        let settings_sub = cx.observe_global::<SettingsStore>(|this, cx| {
+            this.on_settings_changed(cx);
+        });
 
         state.migrate_legacy_tabs();
         let mut saved_tab_sessions = HashMap::new();
@@ -317,7 +335,7 @@ impl AppView {
             resize_drag: None,
             pr_status_by_workspace: HashMap::new(),
             pr_unavailable_by_workspace: HashMap::new(),
-            _subscriptions: vec![file_tree_sub],
+            _subscriptions: vec![file_tree_sub, settings_sub],
             _tasks: Vec::new(),
             git_subscription_idx: None,
             git_panel_subscription_idx: None,
@@ -438,7 +456,7 @@ impl AppView {
             self.daemon_inner = Some(client.inner_handle());
             self.resource_indicator = Some(cx.new(|cx| ResourceIndicator::new(cx, client)));
             self.sync_workspace_names(cx);
-            self.register_all_workspaces_with_daemon();
+            self.register_all_workspaces_with_daemon(cx);
             self.send_active_workspace_focus();
             // Replace any prior PR event poll task in-place so the previous task
             // is dropped (cancellation semantics matter on daemon reconnect).
@@ -456,36 +474,44 @@ impl AppView {
     /// Tell the daemon about every workspace the app currently knows of.
     /// Called once after daemon connect; further changes go through
     /// `register_workspace_with_daemon` / `unregister_workspace_with_daemon`.
-    fn register_all_workspaces_with_daemon(&self) {
+    fn register_all_workspaces_with_daemon(&self, cx: &App) {
         let Some(ref client) = self.daemon_client else {
             return;
         };
         for ws in &self.state.workspaces {
             let project = self.state.projects.iter().find(|p| p.id == ws.project_id);
             let Some(p) = project else { continue };
+            if !self.project_pr_enabled(p.id, cx) {
+                let _ = client.unregister_workspace(ws.id);
+                continue;
+            }
             let working_dir = ws.working_dir(p).to_path_buf();
             let _ = client.register_workspace(
                 ws.id,
                 working_dir,
                 ws.branch.clone(),
-                p.default_branch.clone(),
+                self.effective_default_branch(p, cx),
             );
         }
     }
 
-    fn register_workspace_with_daemon(&self, ws: &Workspace) {
+    fn register_workspace_with_daemon(&self, ws: &Workspace, cx: &App) {
         let Some(ref client) = self.daemon_client else {
             return;
         };
         let Some(project) = self.state.projects.iter().find(|p| p.id == ws.project_id) else {
             return;
         };
+        if !self.project_pr_enabled(project.id, cx) {
+            let _ = client.unregister_workspace(ws.id);
+            return;
+        }
         let working_dir = ws.working_dir(project).to_path_buf();
         let _ = client.register_workspace(
             ws.id,
             working_dir,
             ws.branch.clone(),
-            project.default_branch.clone(),
+            self.effective_default_branch(project, cx),
         );
     }
 
@@ -564,6 +590,66 @@ impl AppView {
                 self.pr_unavailable_by_workspace
                     .insert(workspace_id, reason);
             }
+        }
+    }
+
+    fn on_settings_changed(&mut self, cx: &mut Context<Self>) {
+        self.apply_active_file_tree_settings(cx);
+        self.refresh_active_git_default_branch(cx);
+        self.register_all_workspaces_with_daemon(cx);
+        self.clear_disabled_project_pr_state(cx);
+        cx.notify();
+    }
+
+    fn effective_default_branch(&self, project: &Project, cx: &App) -> String {
+        cx.global::<SettingsStore>()
+            .effective_default_branch(project.id, &project.default_branch)
+    }
+
+    fn project_pr_enabled(&self, project_id: Uuid, cx: &App) -> bool {
+        cx.global::<SettingsStore>()
+            .project_settings(project_id)
+            .map(|settings| settings.pr.enabled)
+            .unwrap_or(true)
+    }
+
+    fn apply_active_file_tree_settings(&self, cx: &mut Context<Self>) {
+        let active_project_id = self.state.active_workspace().map(|ws| ws.project_id);
+        let (respect_gitignore, extra_excludes) =
+            file_tree_settings_for_project(active_project_id, cx);
+        if let Some(file_tree) = &self.file_tree {
+            file_tree.update(cx, |ft, cx| {
+                ft.set_filter_settings(respect_gitignore, extra_excludes, cx);
+            });
+        }
+    }
+
+    fn refresh_active_git_default_branch(&self, cx: &mut Context<Self>) {
+        let Some(ws) = self.state.active_workspace() else {
+            return;
+        };
+        let Some(project) = self.state.project_by_id(ws.project_id) else {
+            return;
+        };
+        let default_branch = self.effective_default_branch(project, cx);
+        if let Some(provider) = &self.git_provider {
+            provider.update(cx, |provider, cx| {
+                provider.set_default_branch(default_branch, cx);
+            });
+        }
+    }
+
+    fn clear_disabled_project_pr_state(&mut self, cx: &App) {
+        let disabled_workspace_ids: Vec<Uuid> = self
+            .state
+            .workspaces
+            .iter()
+            .filter(|ws| !self.project_pr_enabled(ws.project_id, cx))
+            .map(|ws| ws.id)
+            .collect();
+        for workspace_id in disabled_workspace_ids {
+            self.pr_status_by_workspace.remove(&workspace_id);
+            self.pr_unavailable_by_workspace.remove(&workspace_id);
         }
     }
 
@@ -1068,18 +1154,15 @@ impl AppView {
         workspace: &Workspace,
         path: &str,
         category: seoul_workspace::git::types::ChangeCategory,
+        cx: &App,
     ) -> String {
         let Some(project) = self.state.project_by_id(workspace.project_id) else {
             return String::new();
         };
         let runner = seoul_workspace::git::GitCommandRunner::new(workspace.working_dir(project));
-        seoul_workspace::git::diff::get_unified_diff(
-            &runner,
-            path,
-            category,
-            &project.default_branch,
-        )
-        .unwrap_or_default()
+        let default_branch = self.effective_default_branch(project, cx);
+        seoul_workspace::git::diff::get_unified_diff(&runner, path, category, &default_branch)
+            .unwrap_or_default()
     }
 
     fn restore_persisted_tab(
@@ -1141,7 +1224,7 @@ impl AppView {
                 });
             }
             PersistedTabKind::Diff { path, category } => {
-                let diff_text = self.diff_text_for_workspace(workspace, &path, category);
+                let diff_text = self.diff_text_for_workspace(workspace, &path, category, cx);
                 let view_path = path.clone();
                 let diff_view = cx.new(move |cx| {
                     crate::diff_view::DiffView::new(cx, view_path, category, diff_text)
@@ -1658,6 +1741,7 @@ impl AppView {
                     ft.set_root_path(Some(path), cx);
                 });
             }
+            self.apply_active_file_tree_settings(cx);
             self.ensure_workspace_has_tab(ws, window, cx);
         }
 
@@ -1760,8 +1844,23 @@ impl AppView {
             .map(|ws| ws.name.clone())
             .collect();
 
-        let generated =
-            seoul_workspace::workspace::generate_workspace_name(&project.path, &existing_names);
+        let workspace_settings = cx
+            .global::<SettingsStore>()
+            .project_settings(project_id)
+            .map(|settings| settings.workspaces.clone())
+            .unwrap_or_else(|| {
+                cx.global::<SettingsStore>()
+                    .global()
+                    .project
+                    .workspaces
+                    .clone()
+            });
+        let generated = seoul_workspace::workspace::generate_workspace_name_with_options(
+            &project.path,
+            &existing_names,
+            workspace_settings.branch_prefix_mode,
+            &workspace_settings.branch_prefix_custom,
+        );
 
         let branch_input = cx.new(|cx| BranchInput::new(generated.clone(), "branch name", cx));
         let subscription = cx.subscribe_in(
@@ -1813,10 +1912,29 @@ impl AppView {
         };
         let name = prompt.generated_name;
 
-        match Workspace::create(&project, &name, &branch) {
+        let project_settings = cx
+            .global::<SettingsStore>()
+            .project_settings(project.id)
+            .cloned();
+        let worktree_base_dir = project_settings
+            .as_ref()
+            .and_then(|settings| settings.workspaces.worktree_base_dir.as_deref());
+        let default_branch = project_settings
+            .as_ref()
+            .and_then(|settings| settings.git.default_branch.as_deref())
+            .filter(|branch| !branch.trim().is_empty())
+            .unwrap_or(&project.default_branch);
+
+        match Workspace::create_with_options(
+            &project,
+            &name,
+            &branch,
+            worktree_base_dir,
+            default_branch,
+        ) {
             Ok(ws) => {
                 let ws_id = ws.id;
-                self.register_workspace_with_daemon(&ws);
+                self.register_workspace_with_daemon(&ws, cx);
                 self.state.workspaces.push(ws);
                 self.state.active_workspace_id = Some(ws_id);
                 self.send_active_workspace_focus();
@@ -1836,6 +1954,7 @@ impl AppView {
                             ft.set_root_path(Some(path), cx);
                         });
                     }
+                    self.apply_active_file_tree_settings(cx);
                     self.ensure_workspace_has_tab(ws, window, cx);
                 }
                 self.focus_active_pane_item(window, cx);
@@ -1907,6 +2026,7 @@ impl AppView {
                     ft.set_root_path(None, cx);
                 });
             }
+            self.apply_active_file_tree_settings(cx);
         }
 
         self.save_state(cx);
@@ -1989,7 +2109,7 @@ impl AppView {
         };
 
         let worktree_path = ws.working_dir(project).to_path_buf();
-        let default_branch = project.default_branch.clone();
+        let default_branch = self.effective_default_branch(project, cx);
 
         let provider = cx.new(|cx| GitStateProvider::new(worktree_path, default_branch, cx));
         let sub = cx.subscribe(&provider, Self::on_git_state_changed);
@@ -2115,7 +2235,7 @@ impl AppView {
             return;
         };
 
-        let diff_text = self.diff_text_for_workspace(&workspace, &path, category);
+        let diff_text = self.diff_text_for_workspace(&workspace, &path, category, cx);
 
         let tab_id = Uuid::new_v4();
         let view_path = path.clone();
@@ -3171,12 +3291,10 @@ impl AppView {
                         let default_branch = active_ws
                             .and_then(|id| self.state.workspaces.iter().find(|w| w.id == id))
                             .and_then(|ws| {
-                                self.state
-                                    .projects
-                                    .iter()
-                                    .find(|p| p.id == ws.project_id)
-                                    .filter(|p| ws.branch == p.default_branch)
-                                    .map(|p| p.default_branch.clone())
+                                let project =
+                                    self.state.projects.iter().find(|p| p.id == ws.project_id)?;
+                                let default_branch = self.effective_default_branch(project, cx);
+                                (ws.branch == default_branch).then_some(default_branch)
                             });
                         let card = if let Some(default_branch) = default_branch {
                             self.render_remote_compare_card(&default_branch, &t, cx)

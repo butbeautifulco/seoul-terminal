@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use gpui::prelude::FluentBuilder as _;
 use gpui::*;
@@ -8,14 +8,34 @@ use seoul_workspace::git::types::FileStatus;
 use crate::icons::{Icon, IconName};
 use crate::theme;
 
-const IGNORED_NAMES: &[&str] = &[
+const DEFAULT_EXCLUDE_PATTERNS: &[&str] = &[
     ".git",
     "node_modules",
+    "dist",
+    "build",
+    ".next",
+    ".turbo",
+    "coverage",
+    ".cache",
+    ".parcel-cache",
+    ".vite",
+    ".svelte-kit",
+    ".vercel",
     "target",
+    "out",
+    "*.tsbuildinfo",
     ".DS_Store",
     ".seoul",
-    ".cache",
 ];
+
+#[derive(Clone, Debug)]
+struct IgnorePattern {
+    pattern: String,
+    negated: bool,
+    directory_only: bool,
+    anchored: bool,
+    has_slash: bool,
+}
 
 pub struct FileTreeEntry {
     pub path: PathBuf,
@@ -36,12 +56,20 @@ pub struct FileTreeView {
     focus_handle: FocusHandle,
     /// Git status per relative path (from repo root).
     git_status: HashMap<String, FileStatus>,
+    respect_gitignore: bool,
+    extra_excludes: Vec<String>,
+    ignore_patterns: Vec<IgnorePattern>,
 }
 
 impl EventEmitter<FileTreeEvent> for FileTreeView {}
 
 impl FileTreeView {
-    pub fn new(cx: &mut Context<Self>, root_path: Option<PathBuf>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        root_path: Option<PathBuf>,
+        respect_gitignore: bool,
+        extra_excludes: Vec<String>,
+    ) -> Self {
         let focus_handle = cx.focus_handle();
         let mut view = Self {
             entries: Vec::new(),
@@ -50,10 +78,14 @@ impl FileTreeView {
             root_path: root_path.clone(),
             focus_handle,
             git_status: HashMap::new(),
+            respect_gitignore,
+            extra_excludes,
+            ignore_patterns: Vec::new(),
         };
         if let Some(ref root) = root_path {
             view.expanded_dirs.insert(root.clone());
         }
+        view.rebuild_ignore_patterns();
         view.rebuild_entries();
         view
     }
@@ -66,6 +98,23 @@ impl FileTreeView {
         if let Some(ref root) = path {
             self.expanded_dirs.insert(root.clone());
         }
+        self.rebuild_ignore_patterns();
+        self.rebuild_entries();
+        cx.notify();
+    }
+
+    pub fn set_filter_settings(
+        &mut self,
+        respect_gitignore: bool,
+        extra_excludes: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        if self.respect_gitignore == respect_gitignore && self.extra_excludes == extra_excludes {
+            return;
+        }
+        self.respect_gitignore = respect_gitignore;
+        self.extra_excludes = extra_excludes;
+        self.rebuild_ignore_patterns();
         self.rebuild_entries();
         cx.notify();
     }
@@ -83,6 +132,30 @@ impl FileTreeView {
         }
     }
 
+    fn rebuild_ignore_patterns(&mut self) {
+        self.ignore_patterns.clear();
+        for pattern in DEFAULT_EXCLUDE_PATTERNS {
+            if let Some(pattern) = IgnorePattern::parse(pattern) {
+                self.ignore_patterns.push(pattern);
+            }
+        }
+        for pattern in &self.extra_excludes {
+            if let Some(pattern) = IgnorePattern::parse(pattern) {
+                self.ignore_patterns.push(pattern);
+            }
+        }
+        if self.respect_gitignore
+            && let Some(root) = &self.root_path
+            && let Ok(text) = std::fs::read_to_string(root.join(".gitignore"))
+        {
+            for line in text.lines() {
+                if let Some(pattern) = IgnorePattern::parse(line) {
+                    self.ignore_patterns.push(pattern);
+                }
+            }
+        }
+    }
+
     fn collect_entries(&mut self, dir: &PathBuf, depth: usize) {
         let Ok(read_dir) = std::fs::read_dir(dir) else {
             return;
@@ -93,11 +166,11 @@ impl FileTreeView {
 
         for entry in read_dir.flatten() {
             let name = entry.file_name().to_string_lossy().into_owned();
-            if IGNORED_NAMES.contains(&name.as_str()) {
-                continue;
-            }
             let is_dir = entry.file_type().map(|ft| ft.is_dir()).unwrap_or(false);
             let path = entry.path();
+            if self.is_ignored(&path, &name, is_dir) {
+                continue;
+            }
             if is_dir {
                 dirs.push((name, path));
             } else {
@@ -129,6 +202,20 @@ impl FileTreeView {
                 is_dir: false,
             });
         }
+    }
+
+    fn is_ignored(&self, path: &Path, name: &str, is_dir: bool) -> bool {
+        let Some(root) = &self.root_path else {
+            return false;
+        };
+        let rel = path.strip_prefix(root).unwrap_or(path);
+        let mut ignored = false;
+        for pattern in &self.ignore_patterns {
+            if pattern.matches(rel, name, is_dir) {
+                ignored = !pattern.negated;
+            }
+        }
+        ignored
     }
 
     /// Get the git-status color for a file path, if it has git status.
@@ -251,6 +338,124 @@ impl FileTreeView {
             }))
             .into_any_element()
     }
+}
+
+impl IgnorePattern {
+    fn parse(line: &str) -> Option<Self> {
+        let mut pattern = line.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+        if let Some(rest) = pattern.strip_prefix("\\#") {
+            pattern = rest;
+        } else if pattern.starts_with('#') {
+            return None;
+        }
+
+        let negated = pattern.starts_with('!');
+        if negated {
+            pattern = pattern[1..].trim_start();
+        }
+        if pattern.is_empty() {
+            return None;
+        }
+
+        let directory_only = pattern.ends_with('/');
+        if directory_only {
+            pattern = pattern.trim_end_matches('/');
+        }
+
+        let anchored = pattern.starts_with('/');
+        if anchored {
+            pattern = pattern.trim_start_matches('/');
+        }
+
+        let pattern = pattern.trim();
+        if pattern.is_empty() {
+            return None;
+        }
+
+        Some(Self {
+            pattern: pattern.to_string(),
+            negated,
+            directory_only,
+            anchored,
+            has_slash: pattern.contains('/'),
+        })
+    }
+
+    fn matches(&self, rel: &Path, name: &str, is_dir: bool) -> bool {
+        if self.directory_only && !is_dir {
+            return false;
+        }
+
+        let rel_text = path_to_slash_string(rel);
+        if self.anchored || self.has_slash {
+            if self.contains_wildcard() {
+                wildcard_match(&self.pattern, &rel_text)
+            } else if self.directory_only {
+                rel_text == self.pattern
+                    || rel_text
+                        .strip_prefix(&self.pattern)
+                        .is_some_and(|rest| rest.starts_with('/'))
+            } else {
+                rel_text == self.pattern
+            }
+        } else if self.contains_wildcard() {
+            wildcard_match(&self.pattern, name)
+        } else {
+            rel.components().any(|component| match component {
+                Component::Normal(value) => value.to_string_lossy() == self.pattern.as_str(),
+                _ => false,
+            })
+        }
+    }
+
+    fn contains_wildcard(&self) -> bool {
+        self.pattern.contains('*') || self.pattern.contains('?')
+    }
+}
+
+fn path_to_slash_string(path: &Path) -> String {
+    path.components()
+        .filter_map(|component| match component {
+            Component::Normal(value) => Some(value.to_string_lossy()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("/")
+}
+
+fn wildcard_match(pattern: &str, text: &str) -> bool {
+    let pattern = pattern.as_bytes();
+    let text = text.as_bytes();
+    let mut p = 0;
+    let mut t = 0;
+    let mut star = None;
+    let mut star_text = 0;
+
+    while t < text.len() {
+        if p < pattern.len() && (pattern[p] == text[t] || pattern[p] == b'?') {
+            p += 1;
+            t += 1;
+        } else if p < pattern.len() && pattern[p] == b'*' {
+            star = Some(p);
+            p += 1;
+            star_text = t;
+        } else if let Some(star_index) = star {
+            p = star_index + 1;
+            star_text += 1;
+            t = star_text;
+        } else {
+            return false;
+        }
+    }
+
+    while p < pattern.len() && pattern[p] == b'*' {
+        p += 1;
+    }
+
+    p == pattern.len()
 }
 
 impl Focusable for FileTreeView {
